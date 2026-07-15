@@ -9,10 +9,13 @@ import (
 var ErrNotFound = errors.New("indicator not found")
 
 type Value struct {
-	Value       string    `json:"value"`
-	Period      string    `json:"period"`
-	PublishedAt string    `json:"publishedAt"`
-	FetchedAt   time.Time `json:"fetchedAt"`
+	Value        string    `json:"value"`
+	Period       string    `json:"period"`
+	PublishedAt  string    `json:"publishedAt"`
+	FetchedAt    time.Time `json:"fetchedAt"`
+	SourceURL    string    `json:"sourceUrl"`
+	Origin       string    `json:"origin"`
+	EstimateKind string    `json:"estimateKind"`
 }
 
 type Indicator struct {
@@ -41,6 +44,19 @@ type UpdateHistory struct {
 	DetectedAt    time.Time `json:"detectedAt"`
 	SourceName    string    `json:"sourceName"`
 	SourceURL     string    `json:"sourceUrl"`
+	Development   bool      `json:"developmentData"`
+}
+
+type FetchedIndicatorValue struct {
+	IndicatorSlug string
+	Value         string
+	Period        string
+	PublishedAt   time.Time
+	FetchedAt     time.Time
+	SourceName    string
+	SourceURL     string
+	ExternalID    string
+	EstimateKind  string
 }
 
 type IndicatorRepository interface {
@@ -48,10 +64,14 @@ type IndicatorRepository interface {
 	GetBySlug(context.Context, string) (Indicator, error)
 }
 
+type IndicatorValueRepository interface {
+	UpsertFetched(context.Context, []FetchedIndicatorValue) (int, error)
+}
+
 type UpdateHistoryRepository interface {
 	List(context.Context) ([]UpdateHistory, error)
 }
 
 type IndicatorDataProvider interface {
-	Fetch(context.Context) ([]Indicator, error)
+	Fetch(context.Context) ([]FetchedIndicatorValue, error)
 }

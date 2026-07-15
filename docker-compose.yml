@@ -6,11 +6,13 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-kokusei}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kokusei}
     ports:
-      - "5432:5432"
+      # Database access is kept on the host only; phones only need the web port.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/migrations/001_init.up.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
-      - ./database/seeds/001_development.sql:/docker-entrypoint-initdb.d/02_development_seed.sql:ro
+      - ./database/migrations/002_indicator_value_provenance.up.sql:/docker-entrypoint-initdb.d/02_provenance.sql:ro
+      - ./database/seeds/001_development.sql:/docker-entrypoint-initdb.d/03_development_seed.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
@@ -24,7 +26,8 @@ services:
       PORT: "8080"
       ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-http://localhost:3000}
     ports:
-      - "8080:8080"
+      # The browser uses Next.js; keep direct API access on the host only.
+      - "127.0.0.1:8080:8080"
     depends_on:
       database:
         condition: service_healthy
@@ -41,6 +44,18 @@ services:
       - "3000:3000"
     depends_on:
       - backend
+
+  population-import:
+    build: ./backend
+    profiles: ["tools"]
+    entrypoint: ["/import-population"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://kokusei:kokusei@database:5432/kokusei?sslmode=disable}
+      ESTAT_POPULATION_STAT_INF_ID: ${ESTAT_POPULATION_STAT_INF_ID:-000040462410}
+      ESTAT_POPULATION_PUBLISHED_AT: ${ESTAT_POPULATION_PUBLISHED_AT:-2026-06-19}
+    depends_on:
+      database:
+        condition: service_healthy
 
 volumes:
   postgres_data:

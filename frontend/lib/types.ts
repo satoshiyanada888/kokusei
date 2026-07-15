@@ -3,6 +3,9 @@ export type IndicatorValue = {
   period: string;
   publishedAt: string;
   fetchedAt: string;
+  sourceUrl: string;
+  origin: "development" | "official";
+  estimateKind: "development" | "final" | "provisional";
 };
 
 export type Indicator = {
@@ -31,5 +34,5 @@ export type UpdateHistory = {
   detectedAt: string;
   sourceName: string;
   sourceUrl: string;
+  developmentData: boolean;
 };
-

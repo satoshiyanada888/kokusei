@@ -37,3 +37,20 @@ func NewUpdateService(repository domain.UpdateHistoryRepository) *UpdateService 
 func (s *UpdateService) List(ctx context.Context) ([]domain.UpdateHistory, error) {
 	return s.repository.List(ctx)
 }
+
+type ImportService struct {
+	provider   domain.IndicatorDataProvider
+	repository domain.IndicatorValueRepository
+}
+
+func NewImportService(provider domain.IndicatorDataProvider, repository domain.IndicatorValueRepository) *ImportService {
+	return &ImportService{provider: provider, repository: repository}
+}
+
+func (s *ImportService) Import(ctx context.Context) (int, error) {
+	values, err := s.provider.Fetch(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return s.repository.UpsertFetched(ctx, values)
+}

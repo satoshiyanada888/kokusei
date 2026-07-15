@@ -11,8 +11,8 @@ ON CONFLICT (slug) DO UPDATE SET
   category = EXCLUDED.category, source_name = EXCLUDED.source_name,
   source_url = EXCLUDED.source_url, updated_at = NOW();
 
-INSERT INTO indicator_values (indicator_id, value, period, published_at, fetched_at)
-SELECT i.id, v.value, v.period, v.published_at::date, v.fetched_at::timestamptz
+INSERT INTO indicator_values (indicator_id, value, period, published_at, fetched_at, data_origin, source_url, estimate_kind)
+SELECT i.id, v.value, v.period, v.published_at::date, v.fetched_at::timestamptz, 'development', i.source_url, 'development'
 FROM (VALUES
 ('population', 12550, '2020年', '2021-04-01', '2025-01-31T09:00:00+09:00'),
 ('population', 12502, '2021年', '2022-04-01', '2025-01-31T09:00:00+09:00'),
@@ -44,8 +44,8 @@ JOIN indicators i ON i.slug = v.slug
 ON CONFLICT (indicator_id, period) DO UPDATE SET
   value = EXCLUDED.value, published_at = EXCLUDED.published_at, fetched_at = EXCLUDED.fetched_at;
 
-INSERT INTO update_histories (indicator_id, previous_value, current_value, period, detected_at)
-SELECT i.id, h.previous_value, h.current_value, h.period, h.detected_at::timestamptz
+INSERT INTO update_histories (indicator_id, previous_value, current_value, period, detected_at, data_origin, source_url)
+SELECT i.id, h.previous_value, h.current_value, h.period, h.detected_at::timestamptz, 'development', i.source_url
 FROM (VALUES
 ('population', 12410, 12360, '2024年（開発用）', '2025-01-31T09:00:00+09:00'),
 ('births', 72.7, 68.6, '2024年（開発用）', '2025-02-28T09:00:00+09:00'),
@@ -59,4 +59,3 @@ WHERE NOT EXISTS (
 );
 
 COMMIT;
-

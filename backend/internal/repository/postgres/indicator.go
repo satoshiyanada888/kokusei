@@ -19,34 +19,51 @@ func NewIndicatorRepository(db *pgxpool.Pool) *IndicatorRepository {
 const indicatorSelect = `
 SELECT i.slug, i.name, i.description, i.unit, i.category, i.source_name, i.source_url,
        latest.value::text, latest.period, latest.published_at::text, latest.fetched_at,
+       latest.source_url, latest.data_origin, latest.estimate_kind,
        previous.value::text, previous.period, previous.published_at::text, previous.fetched_at,
+       previous.source_url, previous.data_origin, previous.estimate_kind,
        (latest.value - previous.value)::text
 FROM indicators i
 JOIN LATERAL (
-  SELECT value, period, published_at, fetched_at FROM indicator_values
-  WHERE indicator_id = i.id ORDER BY published_at DESC, id DESC LIMIT 1
+  SELECT value, period, published_at, fetched_at, source_url, data_origin, estimate_kind FROM indicator_values
+  WHERE indicator_id = i.id
+    AND data_origin = CASE WHEN EXISTS (SELECT 1 FROM indicator_values x WHERE x.indicator_id=i.id AND x.data_origin='official') THEN 'official' ELSE 'development' END
+  ORDER BY
+    CASE WHEN period ~ '^[0-9]{4}年[0-9]{1,2}月$'
+      THEN substring(period from '^([0-9]{4})')::int * 100 + substring(period from '年([0-9]{1,2})月$')::int
+    END DESC NULLS LAST,
+    published_at DESC, id DESC LIMIT 1
 ) latest ON true
 LEFT JOIN LATERAL (
-  SELECT value, period, published_at, fetched_at FROM indicator_values
-  WHERE indicator_id = i.id ORDER BY published_at DESC, id DESC OFFSET 1 LIMIT 1
+  SELECT value, period, published_at, fetched_at, source_url, data_origin, estimate_kind FROM indicator_values
+  WHERE indicator_id = i.id
+    AND data_origin = CASE WHEN EXISTS (SELECT 1 FROM indicator_values x WHERE x.indicator_id=i.id AND x.data_origin='official') THEN 'official' ELSE 'development' END
+  ORDER BY
+    CASE WHEN period ~ '^[0-9]{4}年[0-9]{1,2}月$'
+      THEN substring(period from '^([0-9]{4})')::int * 100 + substring(period from '年([0-9]{1,2})月$')::int
+    END DESC NULLS LAST,
+    published_at DESC, id DESC OFFSET 1 LIMIT 1
 ) previous ON true`
 
 type scanner interface{ Scan(...any) error }
 
 func scanIndicator(row scanner) (domain.Indicator, error) {
 	var i domain.Indicator
-	var previousValue, previousPeriod, previousPublished *string
+	var previousValue, previousPeriod, previousPublished, previousSource, previousOrigin, previousKind *string
 	var previousFetched *time.Time
 	err := row.Scan(&i.Slug, &i.Name, &i.Description, &i.Unit, &i.Category, &i.SourceName, &i.SourceURL,
 		&i.Latest.Value, &i.Latest.Period, &i.Latest.PublishedAt, &i.Latest.FetchedAt,
-		&previousValue, &previousPeriod, &previousPublished, &previousFetched, &i.Change)
+		&i.Latest.SourceURL, &i.Latest.Origin, &i.Latest.EstimateKind,
+		&previousValue, &previousPeriod, &previousPublished, &previousFetched,
+		&previousSource, &previousOrigin, &previousKind, &i.Change)
 	if err != nil {
 		return i, err
 	}
 	if previousValue != nil {
-		i.Previous = &domain.Value{Value: *previousValue, Period: *previousPeriod, PublishedAt: *previousPublished, FetchedAt: *previousFetched}
+		i.Previous = &domain.Value{Value: *previousValue, Period: *previousPeriod, PublishedAt: *previousPublished, FetchedAt: *previousFetched, SourceURL: *previousSource, Origin: *previousOrigin, EstimateKind: *previousKind}
 	}
-	i.Development = true
+	i.SourceURL = i.Latest.SourceURL
+	i.Development = i.Latest.Origin != "official"
 	return i, nil
 }
 
@@ -75,7 +92,14 @@ func (r *IndicatorRepository) GetBySlug(ctx context.Context, slug string) (domai
 	if err != nil {
 		return i, err
 	}
-	rows, err := r.db.Query(ctx, `SELECT value::text, period, published_at::text, fetched_at FROM indicator_values v JOIN indicators i ON i.id=v.indicator_id WHERE i.slug=$1 ORDER BY published_at, v.id`, slug)
+	rows, err := r.db.Query(ctx, `SELECT value::text, period, published_at::text, fetched_at, v.source_url, data_origin, estimate_kind
+FROM indicator_values v JOIN indicators i ON i.id=v.indicator_id
+WHERE i.slug=$1 AND data_origin = CASE WHEN EXISTS (SELECT 1 FROM indicator_values x WHERE x.indicator_id=i.id AND x.data_origin='official') THEN 'official' ELSE 'development' END
+ORDER BY
+  CASE WHEN period ~ '^[0-9]{4}年[0-9]{1,2}月$'
+    THEN substring(period from '^([0-9]{4})')::int * 100 + substring(period from '年([0-9]{1,2})月$')::int
+  END ASC NULLS FIRST,
+  published_at, v.id`, slug)
 	if err != nil {
 		return i, err
 	}
@@ -83,7 +107,7 @@ func (r *IndicatorRepository) GetBySlug(ctx context.Context, slug string) (domai
 	i.Series = make([]domain.Value, 0)
 	for rows.Next() {
 		var v domain.Value
-		if err := rows.Scan(&v.Value, &v.Period, &v.PublishedAt, &v.FetchedAt); err != nil {
+		if err := rows.Scan(&v.Value, &v.Period, &v.PublishedAt, &v.FetchedAt, &v.SourceURL, &v.Origin, &v.EstimateKind); err != nil {
 			return i, err
 		}
 		i.Series = append(i.Series, v)

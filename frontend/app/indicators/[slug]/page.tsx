@@ -14,9 +14,9 @@ export default async function IndicatorDetail({ params }: { params: Promise<{ sl
   const change = changeLabel(indicator.change);
   return <main className="page py-10 md:py-16">
     <Link href="/" className="text-sm text-[#176b5b]">← ダッシュボード</Link>
-    <div className="mt-8"><DevelopmentNotice /></div>
+    {indicator.developmentData && <div className="mt-8"><DevelopmentNotice /></div>}
     <header className="mt-10 flex flex-col justify-between gap-6 md:flex-row md:items-end">
-      <div><p className="eyebrow">{indicator.category}</p><h1 className="mt-3 text-4xl font-bold">{indicator.name}</h1><p className="mt-5 text-5xl font-bold">{formatValue(indicator.latest.value)} <span className="text-xl font-normal text-[#5b6e6c]">{indicator.unit}</span></p></div>
+      <div><div className="flex items-center gap-3"><p className="eyebrow">{indicator.category}</p>{!indicator.developmentData && <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-900">公式・確定値</span>}</div><h1 className="mt-3 text-4xl font-bold">{indicator.name}</h1><p className="mt-5 text-5xl font-bold">{formatValue(indicator.latest.value)} <span className="text-xl font-normal text-[#5b6e6c]">{indicator.unit}</span></p></div>
       <div className="panel min-w-60 p-5"><p className="label">前回値</p><p className="mt-1 text-xl font-semibold">{indicator.previous ? `${formatValue(indicator.previous.value)} ${indicator.unit}` : "—"}</p><p className="mt-2 text-sm font-semibold">増減 {change.text} {indicator.unit}</p></div>
     </header>
     <section className="panel mt-10 p-5 md:p-8"><div className="mb-8 flex items-center justify-between"><div><p className="eyebrow">Fact</p><h2 className="mt-2 text-2xl font-bold">過去データ</h2></div><p className="text-sm text-[#5b6e6c]">単位：{indicator.unit}</p></div><TrendChart series={indicator.series ?? []} /></section>
@@ -26,4 +26,3 @@ export default async function IndicatorDetail({ params }: { params: Promise<{ sl
     </div>
   </main>;
 }
-

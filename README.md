@@ -54,6 +54,18 @@ docker compose up --build
 
 初回起動時に migration と seed が自動実行されます。停止は `docker compose down`、DBボリュームも初期化する場合は `docker compose down -v` です。
 
+### スマートフォンからアクセスする
+
+Macとスマートフォンを同じWi-Fiに接続し、Docker Composeを起動した状態で次を実行します。
+
+```bash
+make lan-url
+```
+
+表示されたURL（例：`http://192.168.0.21:3000`）をスマートフォンのブラウザで開いてください。MacのIPアドレスはネットワーク接続時に変わる場合があるため、接続できなくなった場合は再度 `make lan-url` を実行します。
+
+macOSのファイアウォールが接続確認を表示した場合は、同一Wi-FiからのNode.js / Dockerへの受信接続を許可してください。会社・ゲストWi-Fiなど端末間通信を遮断するネットワークでは利用できません。WebはLANへ公開されますが、PostgreSQLポートは安全のためMac自身からのみ接続できます。
+
 ## 環境変数
 
 | 変数 | 既定値 / 用途 |
@@ -65,8 +77,22 @@ docker compose up --build
 | `NEXT_PUBLIC_API_URL` | ブラウザから参照できるAPI URL（既定 `http://localhost:8080`） |
 | `INTERNAL_API_URL` | Next.jsサーバーから参照するAPI URL（Compose内では `http://backend:8080`） |
 | `ALLOWED_ORIGIN` | CORSを許可するWeb origin |
+| `ESTAT_APP_ID` | 将来e-Stat API対象統計を追加する場合のアプリケーションID。現在の人口importでは未使用 |
+| `ESTAT_POPULATION_STAT_INF_ID` | 人口推計「全国人口の推移」のe-Statファイル統計表ID。既定は2026年6月公表分 |
+| `ESTAT_POPULATION_PUBLISHED_AT` | 対象統計表の公表日（既定 `2026-06-19`） |
 
 本番環境では `.env.example` の認証情報を使用しないでください。
+
+## 総人口の公式データ取得
+
+総人口のみ、総務省統計局「人口推計」の月次確定値をe-Statの公式Excelから取得できます。この統計表はe-Stat APIの統計データ取得対象ではないため、APIキーは使用しません。取得元、指標定義、単位変換、更新頻度、利用条件は [docs/data-sources/population.md](docs/data-sources/population.md) に記録しています。
+
+```bash
+make migrate
+make fetch-population
+```
+
+取得処理は公式レスポンスを検証してからPostgreSQLへ保存します。同じ期間・同じ値は登録せず、値が変わった場合だけ更新履歴を作成します。取得・検証・保存のいずれかが失敗した場合は既存データを維持します。総人口の公式値が一度も保存されていない環境では、従来の開発用seedが表示されます。
 
 ## Migration と seed
 
@@ -92,6 +118,12 @@ make check
 
 個別には `make test`、`make lint`、`make build` を利用できます。フロント単体は `npm test`、Go単体は `go test ./...` です。
 
+PostgreSQL repository統合テストは、Composeを起動してmigrationを適用した後に実行します。
+
+```bash
+make test-integration
+```
+
 ## API
 
 | Method | Path | 内容 |
@@ -109,4 +141,3 @@ make check
 2. 取得失敗・定義変更・欠損値を検知する運用監視
 3. 出典側の改定値を履歴として保持するデータバージョニング
 4. アクセシビリティ監査、E2Eテスト、長期運用向けバックアップ
-
