@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+:root { color-scheme: light; --ink: #102a2a; --muted: #5b6e6c; --green: #176b5b; --paper: #f5f7f3; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font-family: Arial, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif; }
+a { color: inherit; }
+.page { width: min(1120px, calc(100% - 32px)); margin: 0 auto; }
+.eyebrow { color: var(--green); font-size: .75rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+.panel { background: white; border: 1px solid #dce5df; border-radius: 18px; box-shadow: 0 8px 30px rgba(22, 54, 48, .05); }
+.label { color: var(--muted); font-size: .78rem; }
+
