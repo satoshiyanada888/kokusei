@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kokusei/dashboard/backend/internal/database"
 	"github.com/kokusei/dashboard/backend/internal/handler"
 	"github.com/kokusei/dashboard/backend/internal/repository/postgres"
 	"github.com/kokusei/dashboard/backend/internal/service"
@@ -18,12 +18,12 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	db, err := pgxpool.New(ctx, required("DATABASE_URL"))
+	db, err := database.NewPool(ctx, required("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	if err := db.Ping(ctx); err != nil {
+	if err := pingDatabase(ctx, db); err != nil {
 		log.Fatal(err)
 	}
 
@@ -43,6 +43,30 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+type databasePinger interface {
+	Ping(context.Context) error
+}
+
+func pingDatabase(ctx context.Context, db databasePinger) error {
+	var err error
+	for attempt := 1; attempt <= 6; attempt++ {
+		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = db.Ping(pingCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if attempt < 6 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+	return err
 }
 
 func env(key, fallback string) string {

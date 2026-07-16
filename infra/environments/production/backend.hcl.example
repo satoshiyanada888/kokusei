@@ -1,0 +1,5 @@
+resource_group_name  = "rg-kokusei-tfstate"
+storage_account_name = "replace-with-bootstrap-output"
+container_name       = "tfstate"
+key                  = "production.tfstate"
+use_azuread_auth     = true

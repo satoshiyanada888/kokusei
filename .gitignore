@@ -5,3 +5,14 @@ node_modules/
 coverage/
 *.out
 
+# Terraform local state, caches, plans, and private variable files
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+backend.hcl
+!backend.hcl.example
+crash.log
+crash.*.log

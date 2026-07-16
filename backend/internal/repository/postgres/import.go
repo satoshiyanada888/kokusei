@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -24,6 +25,19 @@ func (r *IndicatorValueRepository) UpsertFetched(ctx context.Context, values []d
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	slug := values[0].IndicatorSlug
+	if slug == "" {
+		return 0, fmt.Errorf("indicator slug is required")
+	}
+	for _, value := range values {
+		sourceURL, err := url.Parse(value.SourceURL)
+		if value.IndicatorSlug != slug || value.SourceName == "" || value.ExternalID == "" || value.Period == "" || value.EstimateKind == "" || err != nil || sourceURL.Scheme != "https" || sourceURL.Host == "" {
+			return 0, fmt.Errorf("invalid fetched indicator metadata")
+		}
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, slug); err != nil {
+		return 0, fmt.Errorf("lock indicator import: %w", err)
+	}
 	changed := 0
 	for _, value := range values {
 		var indicatorID int64
@@ -55,27 +69,12 @@ func (r *IndicatorValueRepository) UpsertFetched(ctx context.Context, values []d
 			return 0, err
 		}
 
-		var previousValue *string
-		if err := tx.QueryRow(ctx, `SELECT value::text FROM indicator_values WHERE indicator_id=$1 AND data_origin='official' ORDER BY published_at DESC, id DESC LIMIT 1`, indicatorID).Scan(&previousValue); err != nil && err != pgx.ErrNoRows {
-			return 0, err
-		}
 		if _, err := tx.Exec(ctx, `INSERT INTO indicator_values (indicator_id,value,period,published_at,fetched_at,data_origin,source_url,external_id,estimate_kind) VALUES ($1,$2::numeric,$3,$4,$5,'official',$6,$7,$8)`, indicatorID, value.Value, value.Period, value.PublishedAt, value.FetchedAt, value.SourceURL, value.ExternalID, value.EstimateKind); err != nil {
 			return 0, err
 		}
-		if previousValue != nil {
-			var equal bool
-			if err := tx.QueryRow(ctx, `SELECT $1::numeric = $2::numeric`, *previousValue, value.Value).Scan(&equal); err != nil {
-				return 0, err
-			}
-			if !equal {
-				if err := insertHistory(ctx, tx, indicatorID, *previousValue, value); err != nil {
-					return 0, err
-				}
-			}
-		}
 		changed++
 	}
-	if _, err := tx.Exec(ctx, `UPDATE indicators SET source_url=$1, updated_at=NOW() WHERE slug=$2`, values[len(values)-1].SourceURL, values[len(values)-1].IndicatorSlug); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE indicators SET source_name=$1, source_url=$2, updated_at=NOW() WHERE slug=$3`, values[len(values)-1].SourceName, values[len(values)-1].SourceURL, slug); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {

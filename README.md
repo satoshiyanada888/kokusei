@@ -36,6 +36,12 @@ docs/       設計メモ
 
 `IndicatorRepository` と `UpdateHistoryRepository` がDBアクセスを隠蔽します。将来の外部取得処理は `IndicatorDataProvider` を実装し、保存処理とは独立して追加できます。PostgreSQLでは `numeric(24,6)`、JSONでは10進文字列を使い、バイナリ浮動小数点への暗黙変換を避けています。詳細は [docs/architecture.md](docs/architecture.md) を参照してください。
 
+## Azure Container Appsへの本番デプロイ
+
+Azure Container Registry、Azure Container Apps、Neon PostgreSQL、GitHub Actions OIDCを使う本番構成を`infra/`と`.github/workflows/`に用意しています。Stage 1（Azure基盤）、Stage 2（Neon Migration・公式データ・image）、Stage 3（公開）に分け、Stage 1ではアプリを作成・公開しません。Secret、Remote State、Migration、公式データ、コスト、ロールバックの手順は [docs/deployment/azure-container-apps.md](docs/deployment/azure-container-apps.md) を参照してください。
+
+Terraformコードの作成だけではAzureリソースは作られません。Subscription、権限、料金、Resource Group、名前衝突を確認し、`terraform plan`の内容について承認を得てからapplyしてください。Neon pooled/direct URLはGitHub `production` Environment Secretsからのみ渡し、Git、tfvars、saved plan、Terraform Stateへ保存しません。出生数と完全失業率の公式取得仕様は [docs/data-sources/births-and-unemployment.md](docs/data-sources/births-and-unemployment.md) を参照してください。
+
 ## 必要なソフトウェア
 
 通常の起動には Docker Desktop（Docker Compose v2）のみ必要です。ホスト上で検証する場合は Go 1.23、Node.js 22、npm 10 も必要です。
@@ -75,13 +81,15 @@ macOSのファイアウォールが接続確認を表示した場合は、同一
 | `POSTGRES_PASSWORD` | ローカルDBパスワード |
 | `DATABASE_URL` | backendからPostgreSQLへの接続URL |
 | `NEXT_PUBLIC_API_URL` | ブラウザから参照できるAPI URL（既定 `http://localhost:8080`） |
+| `NEXT_PUBLIC_SITE_URL` | canonical URL、OGP、sitemap、robotsに使用する公開サイトURL（未設定時 `http://localhost:3000`） |
 | `INTERNAL_API_URL` | Next.jsサーバーから参照するAPI URL（Compose内では `http://backend:8080`） |
 | `ALLOWED_ORIGIN` | CORSを許可するWeb origin |
-| `ESTAT_APP_ID` | 将来e-Stat API対象統計を追加する場合のアプリケーションID。現在の人口importでは未使用 |
+| `ESTAT_APP_ID` | 出生数のe-Stat API取得に必要なapplication ID。人口・完全失業率importでは未使用 |
 | `ESTAT_POPULATION_STAT_INF_ID` | 人口推計「全国人口の推移」のe-Statファイル統計表ID。既定は2026年6月公表分 |
 | `ESTAT_POPULATION_PUBLISHED_AT` | 対象統計表の公表日（既定 `2026-06-19`） |
 
 本番環境では `.env.example` の認証情報を使用しないでください。
+公開前に`NEXT_PUBLIC_SITE_URL`を本番サイトのHTTPS URLへ設定し、Frontendを再ビルドしてください。末尾のスラッシュはどちらでも構いません。
 
 ## 総人口の公式データ取得
 

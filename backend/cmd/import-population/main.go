@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kokusei/dashboard/backend/internal/database"
 	"github.com/kokusei/dashboard/backend/internal/provider"
 	"github.com/kokusei/dashboard/backend/internal/repository/postgres"
 	"github.com/kokusei/dashboard/backend/internal/service"
@@ -22,7 +22,7 @@ func main() {
 	if databaseURL == "" {
 		log.Fatal("DATABASE_URL is required")
 	}
-	db, err := pgxpool.New(ctx, databaseURL)
+	db, err := database.NewPool(ctx, databaseURL)
 	if err != nil {
 		log.Fatal(err)
 	}

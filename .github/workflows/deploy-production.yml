@@ -1,0 +1,281 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type DEPLOY to migrate Neon, validate official data, and publish"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: production
+      url: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+      AZURE_CONTAINER_APP_ENVIRONMENT: ${{ vars.AZURE_CONTAINER_APP_ENVIRONMENT }}
+      AZURE_CONTAINER_APP_FRONTEND: ${{ vars.AZURE_CONTAINER_APP_FRONTEND }}
+      AZURE_CONTAINER_APP_BACKEND: ${{ vars.AZURE_CONTAINER_APP_BACKEND }}
+      FRONTEND_IDENTITY_ID: ${{ vars.FRONTEND_IDENTITY_ID }}
+      BACKEND_IDENTITY_ID: ${{ vars.BACKEND_IDENTITY_ID }}
+      APP_DATABASE_USER: ${{ vars.APP_DATABASE_USER }}
+      NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+      NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+      NEON_MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
+      ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
+
+    steps:
+      - name: Fail closed unless production prerequisites are explicit
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${{ inputs.confirmation }}" = "DEPLOY" ] || { echo "Production deployment was not confirmed"; exit 1; }
+          required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID APP_DATABASE_USER NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL NEON_MIGRATION_DATABASE_URL ESTAT_APP_ID)
+          for name in "${required[@]}"; do
+            [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
+          done
+          case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
+          case "$NEON_DATABASE_URL" in *-pooler.*) ;; *) echo "NEON_DATABASE_URL must be the Neon pooled URL"; exit 1 ;; esac
+          case "$NEON_MIGRATION_DATABASE_URL" in *-pooler.*) echo "Migration must use the Neon direct URL"; exit 1 ;; esac
+          case "$NEON_DATABASE_URL$NEON_MIGRATION_DATABASE_URL" in *sslmode=disable*) echo "Production TLS cannot be disabled"; exit 1 ;; esac
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Verify Frontend
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_SITE_URL: ${{ env.NEXT_PUBLIC_SITE_URL }}
+        run: |
+          npm ci
+          npm run lint
+          npm test
+          npm run build
+
+      - name: Verify Backend and Importers
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "Go files require gofmt:"; printf '%s\n' "$unformatted"; exit 1; }
+          go vet ./...
+          go test ./...
+
+      - name: Build immutable application and migration images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --build-arg NEXT_PUBLIC_SITE_URL="$NEXT_PUBLIC_SITE_URL" -t "kokusei-frontend:$GITHUB_SHA" frontend
+          docker build -t "kokusei-backend:$GITHUB_SHA" backend
+          docker build -t "kokusei-migration:$GITHUB_SHA" database
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push two application images with the commit SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          az acr login --name "$AZURE_CONTAINER_REGISTRY"
+          registry="$(az acr show --name "$AZURE_CONTAINER_REGISTRY" --query loginServer -o tsv)"
+          frontend_image="$registry/frontend:$GITHUB_SHA"
+          backend_image="$registry/backend:$GITHUB_SHA"
+          docker tag "kokusei-frontend:$GITHUB_SHA" "$frontend_image"
+          docker tag "kokusei-backend:$GITHUB_SHA" "$backend_image"
+          docker push "$frontend_image"
+          docker push "$backend_image"
+          {
+            echo "REGISTRY=$registry"
+            echo "FRONTEND_IMAGE=$frontend_image"
+            echo "BACKEND_IMAGE=$backend_image"
+            echo "MIGRATION_IMAGE=kokusei-migration:$GITHUB_SHA"
+            echo "REVISION_SUFFIX=sha-${GITHUB_SHA:0:12}"
+          } >> "$GITHUB_ENV"
+
+      - name: Require both ACR SHA tags before database changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repository in frontend backend; do
+            az acr manifest show-metadata --registry "$AZURE_CONTAINER_REGISTRY" --name "$repository:$GITHUB_SHA" --only-show-errors --output none
+          done
+
+      - name: Migrate Neon, import official data, and validate
+        shell: bash
+        run: scripts/production/run-stage2.sh
+
+      - name: Create or update internal Backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          environment_id="$(az containerapp env show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_ENVIRONMENT" --query id -o tsv)"
+          jq -n \
+            --arg environment_id "$environment_id" \
+            --arg identity_id "$BACKEND_IDENTITY_ID" \
+            --arg registry "$REGISTRY" \
+            --arg image "$BACKEND_IMAGE" \
+            --arg revision "$REVISION_SUFFIX" \
+            '{
+              identity: {type: "UserAssigned", userAssignedIdentities: {($identity_id): {}}},
+              properties: {
+                environmentId: $environment_id,
+                configuration: {
+                  activeRevisionsMode: "Multiple",
+                  ingress: {external: false, targetPort: 8080, transport: "auto", allowInsecure: false},
+                  registries: [{server: $registry, identity: $identity_id}],
+                  secrets: [{name: "neon-database-url", value: env.NEON_DATABASE_URL}]
+                },
+                template: {
+                  revisionSuffix: $revision,
+                  containers: [{
+                    name: "backend",
+                    image: $image,
+                    resources: {cpu: 0.25, memory: "0.5Gi"},
+                    env: [
+                      {name: "DATABASE_URL", secretRef: "neon-database-url"},
+                      {name: "DATABASE_POOL_MAX_CONNS", value: "5"},
+                      {name: "PORT", value: "8080"}
+                    ],
+                    probes: [
+                      {type: "Startup", httpGet: {path: "/health", port: 8080}, initialDelaySeconds: 5, periodSeconds: 5, failureThreshold: 10},
+                      {type: "Liveness", httpGet: {path: "/health", port: 8080}, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 3},
+                      {type: "Readiness", httpGet: {path: "/health", port: 8080}, initialDelaySeconds: 5, periodSeconds: 5, failureThreshold: 3}
+                    ]
+                  }],
+                  scale: {minReplicas: 0, maxReplicas: 2}
+                }
+              }
+            }' > "$RUNNER_TEMP/backend-container-app.json"
+          if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --output none 2>/dev/null; then
+            az containerapp update -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" \
+              --yaml "$RUNNER_TEMP/backend-container-app.json" --only-show-errors --output none
+          else
+            az containerapp create -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" \
+              --environment "$AZURE_CONTAINER_APP_ENVIRONMENT" \
+              --yaml "$RUNNER_TEMP/backend-container-app.json" --only-show-errors --output none
+          fi
+          rm -f "$RUNNER_TEMP/backend-container-app.json"
+          backend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --query properties.configuration.ingress.fqdn -o tsv)"
+          echo "BACKEND_URL=https://$backend_fqdn" >> "$GITHUB_ENV"
+
+      - name: Verify internal Backend health and three official indicators
+        shell: bash
+        run: |
+          set -euo pipefail
+          job="kokusei-prod-smoke"
+          if ! az containerapp job show -g "$AZURE_RESOURCE_GROUP" -n "$job" --output none 2>/dev/null; then
+            az containerapp job create -g "$AZURE_RESOURCE_GROUP" -n "$job" \
+              --environment "$AZURE_CONTAINER_APP_ENVIRONMENT" --trigger-type Manual \
+              --replica-completion-count 1 --parallelism 1 --replica-retry-limit 0 --replica-timeout 600 \
+              --image "$BACKEND_IMAGE" --command /smoke-test \
+              --mi-user-assigned "$BACKEND_IDENTITY_ID" --registry-server "$REGISTRY" --registry-identity "$BACKEND_IDENTITY_ID" \
+              --env-vars TARGET_URL="$BACKEND_URL" --cpu 0.25 --memory 0.5Gi --only-show-errors --output none
+          else
+            az containerapp job update -g "$AZURE_RESOURCE_GROUP" -n "$job" --image "$BACKEND_IMAGE" \
+              --command /smoke-test --replace-env-vars TARGET_URL="$BACKEND_URL" --output none
+          fi
+          execution="$(az containerapp job start -g "$AZURE_RESOURCE_GROUP" -n "$job" --query name -o tsv)"
+          for attempt in {1..60}; do
+            status="$(az containerapp job execution show -g "$AZURE_RESOURCE_GROUP" -n "$job" --job-execution-name "$execution" --query properties.status -o tsv)"
+            case "$status" in Succeeded) break ;; Failed) echo "Backend health/API validation failed"; exit 1 ;; esac
+            [ "$attempt" -lt 60 ] || { echo "Backend health/API validation timed out"; exit 1; }
+            sleep 10
+          done
+
+      - name: Create or update Frontend after Backend validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          environment_id="$(az containerapp env show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_ENVIRONMENT" --query id -o tsv)"
+          jq -n \
+            --arg environment_id "$environment_id" \
+            --arg identity_id "$FRONTEND_IDENTITY_ID" \
+            --arg registry "$REGISTRY" \
+            --arg image "$FRONTEND_IMAGE" \
+            --arg revision "$REVISION_SUFFIX" \
+            --arg backend_url "$BACKEND_URL" \
+            '{
+              identity: {type: "UserAssigned", userAssignedIdentities: {($identity_id): {}}},
+              properties: {
+                environmentId: $environment_id,
+                configuration: {
+                  activeRevisionsMode: "Multiple",
+                  ingress: {external: true, targetPort: 3000, transport: "auto", allowInsecure: false},
+                  registries: [{server: $registry, identity: $identity_id}]
+                },
+                template: {
+                  revisionSuffix: $revision,
+                  containers: [{
+                    name: "frontend",
+                    image: $image,
+                    resources: {cpu: 0.25, memory: "0.5Gi"},
+                    env: [{name: "INTERNAL_API_URL", value: $backend_url}]
+                  }],
+                  scale: {minReplicas: 0, maxReplicas: 2}
+                }
+              }
+            }' > "$RUNNER_TEMP/frontend-container-app.json"
+          if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --output none 2>/dev/null; then
+            az containerapp update -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" \
+              --yaml "$RUNNER_TEMP/frontend-container-app.json" --only-show-errors --output none
+          else
+            jq '.properties.configuration.ingress.external = false' \
+              "$RUNNER_TEMP/frontend-container-app.json" > "$RUNNER_TEMP/frontend-container-app-internal.json"
+            az containerapp create -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" \
+              --environment "$AZURE_CONTAINER_APP_ENVIRONMENT" \
+              --yaml "$RUNNER_TEMP/frontend-container-app-internal.json" --only-show-errors --output none
+            initial_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.configuration.ingress.fqdn -o tsv)"
+            [ "https://$initial_fqdn" = "${NEXT_PUBLIC_SITE_URL%/}" ] || { echo "Initial Frontend FQDN does not match NEXT_PUBLIC_SITE_URL; ingress remains internal"; exit 1; }
+            az containerapp update -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" \
+              --yaml "$RUNNER_TEMP/frontend-container-app.json" --only-show-errors --output none
+          fi
+          rm -f "$RUNNER_TEMP/frontend-container-app.json" "$RUNNER_TEMP/frontend-container-app-internal.json"
+          frontend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.configuration.ingress.fqdn -o tsv)"
+          [ "https://$frontend_fqdn" = "${NEXT_PUBLIC_SITE_URL%/}" ] || { echo "Frontend FQDN does not match NEXT_PUBLIC_SITE_URL"; exit 1; }
+
+      - name: Verify public HTTPS pages and metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          site="${NEXT_PUBLIC_SITE_URL%/}"
+          for path in / /indicators/population /indicators/births /indicators/unemployment-rate /updates /robots.txt /sitemap.xml /og-image.png; do
+            curl --fail --silent --show-error --location --retry 12 --retry-all-errors --retry-delay 5 --output /dev/null "$site$path"
+          done
+          html="$(curl --fail --silent --show-error --location "$site/")"
+          printf '%s' "$html" | grep -F "<link rel=\"canonical\" href=\"$site/\""
+          printf '%s' "$html" | grep -F "property=\"og:url\" content=\"$site/\""
+          printf '%s' "$html" | grep -F "property=\"og:image\" content=\"$site/og-image.png\""
+          printf '%s' "$html" | grep -F "name=\"twitter:image\" content=\"$site/og-image.png\""
+          curl --fail --silent --show-error "$site/sitemap.xml" | grep -F "$site/"
+          curl --fail --silent --show-error "$site/robots.txt" | grep -F "$site/sitemap.xml"

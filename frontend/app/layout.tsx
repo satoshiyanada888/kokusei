@@ -1,19 +1,44 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import { SiteFooter } from "@/components/SiteFooter";
+import { SiteHeader } from "@/components/SiteHeader";
+import { buildAbsoluteUrl, siteConfig } from "@/lib/siteConfig";
 import "./globals.css";
 
-export const metadata: Metadata = { title: "KOKUSEI | 日本を、データで知る。", description: "公的機関の一次情報を確認できる日本の統計ダッシュボード" };
+export const metadata: Metadata = {
+  metadataBase: new URL(siteConfig.url),
+  applicationName: siteConfig.name,
+  title: { default: siteConfig.title, template: `%s | ${siteConfig.name}` },
+  description: siteConfig.description,
+  authors: [{ name: siteConfig.creator }],
+  creator: siteConfig.creator,
+  publisher: siteConfig.publisher,
+  category: siteConfig.category,
+  icons: {
+    icon: [{ url: "/icon.svg", type: "image/svg+xml" }],
+    apple: [{ url: "/apple-icon.png", sizes: "180x180", type: "image/png" }],
+  },
+  robots: { index: true, follow: true },
+  openGraph: {
+    type: "website",
+    locale: siteConfig.locale,
+    siteName: siteConfig.name,
+    title: siteConfig.title,
+    description: siteConfig.description,
+    url: buildAbsoluteUrl("/"),
+    images: [{ url: buildAbsoluteUrl(siteConfig.ogImagePath), width: 1200, height: 630, alt: siteConfig.ogImageAlt }],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: siteConfig.title,
+    description: siteConfig.description,
+    images: [{ url: buildAbsoluteUrl(siteConfig.ogImagePath), alt: siteConfig.ogImageAlt }],
+  },
+};
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="ja"><body>
-    <header className="border-b border-[#dce5df] bg-white/90">
-      <div className="page flex h-16 items-center justify-between">
-        <Link href="/" className="text-lg font-bold tracking-[.12em] no-underline">KOKUSEI</Link>
-        <nav className="flex gap-6 text-sm"><Link href="/">ダッシュボード</Link><Link href="/updates">更新履歴</Link></nav>
-      </div>
-    </header>
-    {children}
-    <footer className="mt-20 border-t border-[#dce5df] py-10 text-center text-sm text-[#5b6e6c]">KOKUSEI — 一次情報から、日本の現在地を確認する。</footer>
+  return <html lang="ja"><body className="flex min-h-screen flex-col">
+    <SiteHeader />
+    <div className="flex-1">{children}</div>
+    <SiteFooter />
   </body></html>;
 }
-

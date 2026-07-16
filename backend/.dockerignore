@@ -1,3 +1,9 @@
 api
 *.out
 .DS_Store
+.env
+.env.*
+!.env.example
+.git
+coverage
+*.log
