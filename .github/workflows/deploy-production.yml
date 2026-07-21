@@ -10,50 +10,24 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: production-deployment
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  validate:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    environment:
-      name: production
-      url: ${{ vars.NEXT_PUBLIC_SITE_URL }}
-    env:
-      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-      AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY }}
-      AZURE_CONTAINER_APP_ENVIRONMENT: ${{ vars.AZURE_CONTAINER_APP_ENVIRONMENT }}
-      AZURE_CONTAINER_APP_FRONTEND: ${{ vars.AZURE_CONTAINER_APP_FRONTEND }}
-      AZURE_CONTAINER_APP_BACKEND: ${{ vars.AZURE_CONTAINER_APP_BACKEND }}
-      FRONTEND_IDENTITY_ID: ${{ vars.FRONTEND_IDENTITY_ID }}
-      BACKEND_IDENTITY_ID: ${{ vars.BACKEND_IDENTITY_ID }}
-      APP_DATABASE_USER: ${{ vars.APP_DATABASE_USER }}
-      NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
-      NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-      NEON_MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
-      ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
-
+    timeout-minutes: 30
     steps:
-      - name: Fail closed unless production prerequisites are explicit
+      - name: Require an explicit deployment request
+        env:
+          DEPLOY_CONFIRMATION: ${{ inputs.confirmation }}
         shell: bash
         run: |
           set -euo pipefail
-          [ "${{ inputs.confirmation }}" = "DEPLOY" ] || { echo "Production deployment was not confirmed"; exit 1; }
-          required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID APP_DATABASE_USER NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL NEON_MIGRATION_DATABASE_URL ESTAT_APP_ID)
-          for name in "${required[@]}"; do
-            [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
-          done
-          case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
-          case "$NEON_DATABASE_URL" in *-pooler.*) ;; *) echo "NEON_DATABASE_URL must be the Neon pooled URL"; exit 1 ;; esac
-          case "$NEON_MIGRATION_DATABASE_URL" in *-pooler.*) echo "Migration must use the Neon direct URL"; exit 1 ;; esac
-          case "$NEON_DATABASE_URL$NEON_MIGRATION_DATABASE_URL" in *sslmode=disable*) echo "Production TLS cannot be disabled"; exit 1 ;; esac
+          [ "$DEPLOY_CONFIRMATION" = "DEPLOY" ] || { echo "Production deployment was not confirmed"; exit 1; }
 
       - uses: actions/checkout@v4
 
@@ -70,8 +44,6 @@ jobs:
 
       - name: Verify Frontend
         working-directory: frontend
-        env:
-          NEXT_PUBLIC_SITE_URL: ${{ env.NEXT_PUBLIC_SITE_URL }}
         run: |
           npm ci
           npm run lint
@@ -88,6 +60,54 @@ jobs:
           go vet ./...
           go test ./...
 
+      - name: Verify production workflow guards
+        run: scripts/production/check-workflow-guards.sh
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: production
+      url: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_FEDERATED_SUBJECT: ${{ vars.AZURE_FEDERATED_SUBJECT }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+      AZURE_CONTAINER_APP_ENVIRONMENT: ${{ vars.AZURE_CONTAINER_APP_ENVIRONMENT }}
+      AZURE_CONTAINER_APP_FRONTEND: ${{ vars.AZURE_CONTAINER_APP_FRONTEND }}
+      AZURE_CONTAINER_APP_BACKEND: ${{ vars.AZURE_CONTAINER_APP_BACKEND }}
+      FRONTEND_IDENTITY_ID: ${{ vars.FRONTEND_IDENTITY_ID }}
+      BACKEND_IDENTITY_ID: ${{ vars.BACKEND_IDENTITY_ID }}
+      APP_DATABASE_USER: ${{ vars.APP_DATABASE_USER }}
+      NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail closed unless production prerequisites are explicit
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          NEON_MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
+          ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID APP_DATABASE_USER NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL NEON_MIGRATION_DATABASE_URL ESTAT_APP_ID)
+          for name in "${required[@]}"; do
+            [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
+          done
+          case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
+          scripts/production/validate-neon-urls.py
+          echo "Production target commit: $GITHUB_SHA"
+
       - name: Build immutable application and migration images
         shell: bash
         run: |
@@ -97,6 +117,19 @@ jobs:
           docker build -t "kokusei-migration:$GITHUB_SHA" database
 
       - name: Azure login with OIDC
+        env:
+          EXPECTED_OIDC_SUBJECT: ${{ env.AZURE_FEDERATED_SUBJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2FAzureADTokenExchange")"
+          token="$(printf '%s' "$response" | jq -er '.value')"
+          OIDC_TOKEN="$token" scripts/production/verify-github-oidc-claims.py
+          unset token response
+
+      - name: Authenticate to Azure with verified OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
@@ -133,10 +166,16 @@ jobs:
 
       - name: Migrate Neon, import official data, and validate
         shell: bash
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          NEON_MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
+          ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
         run: scripts/production/run-stage2.sh
 
       - name: Create or update internal Backend
         shell: bash
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
         run: |
           set -euo pipefail
           environment_id="$(az containerapp env show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_ENVIRONMENT" --query id -o tsv)"

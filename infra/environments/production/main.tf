@@ -1,7 +1,8 @@
 locals {
-  compact_prefix    = replace(var.name_prefix, "-", "")
-  frontend_app_name = "${var.name_prefix}-frontend"
-  backend_app_name  = "${var.name_prefix}-backend"
+  compact_prefix      = replace(var.name_prefix, "-", "")
+  frontend_app_name   = "${var.name_prefix}-frontend"
+  backend_app_name    = "${var.name_prefix}-backend"
+  github_oidc_subject = "repo:${var.github_repository}:environment:${var.github_environment}"
 }
 
 resource "random_string" "global_suffix" {
@@ -84,7 +85,7 @@ resource "azurerm_federated_identity_credential" "github_production" {
   user_assigned_identity_id = azurerm_user_assigned_identity.github_deploy.id
   audience                  = ["api://AzureADTokenExchange"]
   issuer                    = "https://token.actions.githubusercontent.com"
-  subject                   = "repo:${var.github_repository}:environment:${var.github_environment}"
+  subject                   = local.github_oidc_subject
 }
 
 resource "azurerm_role_assignment" "github_container_apps" {

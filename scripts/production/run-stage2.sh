@@ -6,11 +6,7 @@ for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || { echo "Required Stage 2 setting is missing: $name" >&2; exit 1; }
 done
 [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "GITHUB_SHA must be a full commit SHA" >&2; exit 1; }
-[[ "$NEON_DATABASE_URL" == postgresql://* || "$NEON_DATABASE_URL" == postgres://* ]] || { echo "NEON_DATABASE_URL must be a PostgreSQL URL" >&2; exit 1; }
-[[ "$NEON_MIGRATION_DATABASE_URL" == postgresql://* || "$NEON_MIGRATION_DATABASE_URL" == postgres://* ]] || { echo "NEON_MIGRATION_DATABASE_URL must be a PostgreSQL URL" >&2; exit 1; }
-[[ "$NEON_DATABASE_URL" == *"sslmode="* ]] || { echo "NEON_DATABASE_URL must require Neon TLS" >&2; exit 1; }
-[[ "$NEON_MIGRATION_DATABASE_URL" == *"sslmode="* ]] || { echo "NEON_MIGRATION_DATABASE_URL must require Neon TLS" >&2; exit 1; }
-[[ "$NEON_DATABASE_URL" != *"sslmode=disable"* && "$NEON_MIGRATION_DATABASE_URL" != *"sslmode=disable"* ]] || { echo "Production database TLS cannot be disabled" >&2; exit 1; }
+scripts/production/validate-neon-urls.py
 
 docker image inspect "$MIGRATION_IMAGE" >/dev/null
 docker image inspect "$BACKEND_IMAGE" >/dev/null

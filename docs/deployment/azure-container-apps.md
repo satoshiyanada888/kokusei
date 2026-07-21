@@ -1,6 +1,6 @@
 # Azure Container Apps + Neon 初回公開手順
 
-2026-07-16時点のKOKUSEI本番構成。Production apply、Neon作成、本番Migration、GitHub設定はまだ実施していない。
+2026-07-21時点のKOKUSEI本番構成。Neon PostgreSQLの作成、Migration、公式データ検証は完了している。Azure Production Stage 1 applyとGitHub `production` Environment設定は未実施。
 
 ```text
 利用者
@@ -16,6 +16,8 @@ Azure PostgreSQL Flexible Server、VNet、subnet、Private DNS、database passwo
 
 Terraformが作るのはResource Group、ACR Basic、Log Analytics、Consumption Container Apps Environment、Frontend・Backend・GitHub OIDC用の3つのUser Assigned Identityと必要なrole assignmentだけ。Container App、Job、VNet、DBは作らず、サービスは公開されない。
 
+2026-07-21のread-only確認では`rg-kokusei-prod`は存在せず、Bootstrap用`rg-kokusei-tfstate`は`Deleting`、残存リソースは0件だった。Remote State用Storage Accountとprivate containerが利用可能になるまで、Productionの`terraform init`、plan、applyへ進まない。Bootstrap復旧・再作成は別planと承認を必要とする。
+
 ```bash
 cd infra/environments/production
 cp backend.hcl.example backend.hcl
@@ -23,8 +25,11 @@ cp terraform.tfvars.example terraform.tfvars
 terraform init -backend-config=backend.hcl
 terraform fmt -check -recursive ../../
 terraform validate
-terraform plan
-# planの別承認後だけ terraform apply
+terraform plan -out=production-stage1.tfplan
+../../../scripts/production/check-stage1-plan.sh production-stage1.tfplan
+terraform show -no-color production-stage1.tfplan
+# planの別承認後だけ、同じsaved planをapplyする
+terraform apply production-stage1.tfplan
 ```
 
 ## Neonを手動作成する
@@ -63,6 +68,8 @@ Neon Consoleが発行する`sslmode=require&channel_binding=require`等を含む
 ## GitHub Production Environment
 
 Settings > Environmentsで`production`を手動作成し、Required Reviewerとmain branchだけのdeployment branch ruleを設定する。未設定のまま設定済みと扱わない。
+
+Secrets・Variablesの取得元、Stage 1 saved plan、OIDC/RBAC確認、実行・中止・再実行・rotation・rollbackの手順は[GitHub Production Environment 設定・実行手順](github-production-configuration.md)を参照する。
 
 Secrets:
 
@@ -143,7 +150,9 @@ BudgetはStage 1 apply後、Azure PortalのCost Management > BudgetsでProductio
 
 ## State
 
-Production Remote Stateはprivate Azure Blobで、現時点では空。Neon URLとGitHub SecretはTerraform入力に存在しないためplan/stateへ入らない。Bootstrap Stateは同じprivate containerの`bootstrap.tfstate`へremote移行済みで、Blob lease lock、versioning、14日削除保持を使用する。
+設計上、Production Remote Stateはprivate Azure Blobを使用し、Neon URLとGitHub SecretはTerraform入力に存在しないためplan/stateへ入らない。Storage AccountはBlob lease lock、versioning、14日削除保持を有効にする。
+
+ただし2026-07-21時点ではBootstrap Resource Groupが削除中で、Remote State用リソースは存在しない。過去のRemote Stateが利用可能、または復旧済みと扱ってはならない。Stage 1 plan前に、Bootstrap Stateの安全な保管場所、復旧元、作成対象、0 destroyであることを別レビューし、private containerへの接続を確認する。
 
 Storage Account自身を同じStateが管理する循環は残る。Storage削除前にはStateを別backend/暗号化backupへ移す。復旧はBlob Data Contributor権限を戻し、backend.hclを再作成して`terraform init -reconfigure`する。
 

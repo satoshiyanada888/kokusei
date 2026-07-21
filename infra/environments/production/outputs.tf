@@ -40,6 +40,11 @@ output "github_actions_client_id" {
   value       = azurerm_user_assigned_identity.github_deploy.client_id
 }
 
+output "github_actions_federated_subject" {
+  description = "Set as GitHub production Environment variable AZURE_FEDERATED_SUBJECT and verify before Azure login."
+  value       = local.github_oidc_subject
+}
+
 output "frontend_identity_id" {
   description = "Resource ID used by the frontend Container App for ACR pull."
   value       = azurerm_user_assigned_identity.frontend.id
