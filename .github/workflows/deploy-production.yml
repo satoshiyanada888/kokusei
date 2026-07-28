@@ -1,10 +1,22 @@
-name: Deploy production
+name: Publish production (Stage 3)
 
 on:
   workflow_dispatch:
     inputs:
+      commit_sha:
+        description: "Full commit SHA completed by Production Stage 2"
+        required: true
+        type: string
+      frontend_image_digest:
+        description: "Frontend sha256 digest reported by Production Stage 2"
+        required: true
+        type: string
+      backend_image_digest:
+        description: "Backend sha256 digest reported by Production Stage 2"
+        required: true
+        type: string
       confirmation:
-        description: "Type DEPLOY to migrate Neon, validate official data, and publish"
+        description: "Type PUBLISH to create or update the production Container Apps"
         required: true
         type: string
 
@@ -19,55 +31,44 @@ jobs:
   validate:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
+    env:
+      TARGET_COMMIT: ${{ inputs.commit_sha }}
+      FRONTEND_DIGEST: ${{ inputs.frontend_image_digest }}
+      BACKEND_DIGEST: ${{ inputs.backend_image_digest }}
+      PUBLISH_CONFIRMATION: ${{ inputs.confirmation }}
     steps:
-      - name: Require an explicit deployment request
-        env:
-          DEPLOY_CONFIRMATION: ${{ inputs.confirmation }}
+      - name: Require explicit immutable Stage 3 inputs
         shell: bash
         run: |
           set -euo pipefail
-          [ "$DEPLOY_CONFIRMATION" = "DEPLOY" ] || { echo "Production deployment was not confirmed"; exit 1; }
+          [ "$PUBLISH_CONFIRMATION" = "PUBLISH" ] || { echo "Production Stage 3 was not confirmed"; exit 1; }
+          [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "commit_sha must be a full Git commit SHA"; exit 1; }
+          [[ "$FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "frontend_image_digest must be a sha256 digest"; exit 1; }
+          [[ "$BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "backend_image_digest must be a sha256 digest"; exit 1; }
 
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          fetch-depth: 0
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
-
-      - name: Verify Frontend
-        working-directory: frontend
-        run: |
-          npm ci
-          npm run lint
-          npm test
-          npm run build
-
-      - name: Verify Backend and Importers
-        working-directory: backend
+      - name: Require the target commit to exist on main
         shell: bash
         run: |
           set -euo pipefail
-          unformatted="$(gofmt -l .)"
-          [ -z "$unformatted" ] || { echo "Go files require gofmt:"; printf '%s\n' "$unformatted"; exit 1; }
-          go vet ./...
-          go test ./...
+          git cat-file -e "${TARGET_COMMIT}^{commit}"
+          git merge-base --is-ancestor "$TARGET_COMMIT" origin/main || {
+            echo "The requested commit does not exist on the production main branch"
+            exit 1
+          }
 
       - name: Verify production workflow guards
         run: scripts/production/check-workflow-guards.sh
 
-  deploy:
+  publish:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
@@ -75,6 +76,9 @@ jobs:
       name: production
       url: ${{ vars.NEXT_PUBLIC_SITE_URL }}
     env:
+      TARGET_COMMIT: ${{ inputs.commit_sha }}
+      FRONTEND_DIGEST: ${{ inputs.frontend_image_digest }}
+      BACKEND_DIGEST: ${{ inputs.backend_image_digest }}
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
       AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
@@ -86,39 +90,29 @@ jobs:
       AZURE_CONTAINER_APP_BACKEND: ${{ vars.AZURE_CONTAINER_APP_BACKEND }}
       FRONTEND_IDENTITY_ID: ${{ vars.FRONTEND_IDENTITY_ID }}
       BACKEND_IDENTITY_ID: ${{ vars.BACKEND_IDENTITY_ID }}
-      APP_DATABASE_USER: ${{ vars.APP_DATABASE_USER }}
       NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fail closed unless production prerequisites are explicit
+      - name: Fail closed unless Stage 3 prerequisites are explicit
         env:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          NEON_MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
-          ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
+          NEON_URL_VALIDATION_MODE: backend
         shell: bash
         run: |
           set -euo pipefail
-          required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID APP_DATABASE_USER NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL NEON_MIGRATION_DATABASE_URL ESTAT_APP_ID)
+          required=(TARGET_COMMIT FRONTEND_DIGEST BACKEND_DIGEST AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL)
           for name in "${required[@]}"; do
             [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
           done
           case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
           scripts/production/validate-neon-urls.py
-          echo "Production target commit: $GITHUB_SHA"
 
-      - name: Build immutable application and migration images
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker build --build-arg NEXT_PUBLIC_SITE_URL="$NEXT_PUBLIC_SITE_URL" -t "kokusei-frontend:$GITHUB_SHA" frontend
-          docker build -t "kokusei-backend:$GITHUB_SHA" backend
-          docker build -t "kokusei-migration:$GITHUB_SHA" database
-
-      - name: Azure login with OIDC
+      - name: Verify GitHub OIDC claims
         env:
           EXPECTED_OIDC_SUBJECT: ${{ env.AZURE_FEDERATED_SUBJECT }}
+          EXPECTED_WORKFLOW_PATH: .github/workflows/deploy-production.yml
         shell: bash
         run: |
           set -euo pipefail
@@ -136,49 +130,73 @@ jobs:
           tenant-id: ${{ env.AZURE_TENANT_ID }}
           subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Push two application images with the commit SHA
+      - name: Verify Stage 2 digests and linux/amd64 manifests
         shell: bash
         run: |
           set -euo pipefail
           az acr login --name "$AZURE_CONTAINER_REGISTRY"
           registry="$(az acr show --name "$AZURE_CONTAINER_REGISTRY" --query loginServer -o tsv)"
-          frontend_image="$registry/frontend:$GITHUB_SHA"
-          backend_image="$registry/backend:$GITHUB_SHA"
-          docker tag "kokusei-frontend:$GITHUB_SHA" "$frontend_image"
-          docker tag "kokusei-backend:$GITHUB_SHA" "$backend_image"
-          docker push "$frontend_image"
-          docker push "$backend_image"
+
+          verify_image() {
+            repository=$1
+            digest=$2
+            image_ref="$registry/$repository@$digest"
+            metadata="$(az acr manifest show-metadata \
+              --registry "$AZURE_CONTAINER_REGISTRY" \
+              --name "$repository@$digest" -o json)"
+            actual_digest="$(jq -er '.digest' <<<"$metadata")"
+            [ "$actual_digest" = "$digest" ] || { echo "$repository digest does not match ACR"; exit 1; }
+            jq -e --arg sha "$TARGET_COMMIT" '.tags | index($sha) != null' <<<"$metadata" >/dev/null || {
+              echo "$repository digest is not tagged with the requested commit SHA"
+              exit 1
+            }
+
+            platform="$(scripts/production/verify-image-platform.sh "$image_ref")"
+            unset metadata
+            [ "$platform" = "linux/amd64" ] || {
+              echo "$repository image must be linux/amd64"
+              exit 1
+            }
+          }
+
+          verify_image frontend "$FRONTEND_DIGEST"
+          verify_image backend "$BACKEND_DIGEST"
+
           {
             echo "REGISTRY=$registry"
-            echo "FRONTEND_IMAGE=$frontend_image"
-            echo "BACKEND_IMAGE=$backend_image"
-            echo "MIGRATION_IMAGE=kokusei-migration:$GITHUB_SHA"
-            echo "REVISION_SUFFIX=sha-${GITHUB_SHA:0:12}"
+            echo "FRONTEND_IMAGE=$registry/frontend@$FRONTEND_DIGEST"
+            echo "BACKEND_IMAGE=$registry/backend@$BACKEND_DIGEST"
+            echo "REVISION_SUFFIX=sha-${TARGET_COMMIT:0:8}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           } >> "$GITHUB_ENV"
 
-      - name: Require both ACR SHA tags before database changes
+      - name: Verify the expected Frontend FQDN before deployment
         shell: bash
         run: |
           set -euo pipefail
-          for repository in frontend backend; do
-            az acr manifest show-metadata --registry "$AZURE_CONTAINER_REGISTRY" --name "$repository:$GITHUB_SHA" --only-show-errors --output none
-          done
-
-      - name: Migrate Neon, import official data, and validate
-        shell: bash
-        env:
-          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          NEON_MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
-          ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
-        run: scripts/production/run-stage2.sh
+          environment_domain="$(az containerapp env show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$AZURE_CONTAINER_APP_ENVIRONMENT" \
+            --query properties.defaultDomain -o tsv)"
+          expected_url="https://$AZURE_CONTAINER_APP_FRONTEND.$environment_domain"
+          [ "$expected_url" = "${NEXT_PUBLIC_SITE_URL%/}" ] || {
+            echo "NEXT_PUBLIC_SITE_URL does not match the expected Frontend FQDN"
+            exit 1
+          }
 
       - name: Create or update internal Backend
-        shell: bash
         env:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        shell: bash
         run: |
           set -euo pipefail
+          temporary_directory="$(mktemp -d "$RUNNER_TEMP/kokusei-stage3-backend.XXXXXX")"
+          cleanup() {
+            rm -rf "$temporary_directory"
+          }
+          trap cleanup EXIT HUP INT TERM
+
           environment_id="$(az containerapp env show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_ENVIRONMENT" --query id -o tsv)"
+          specification="$temporary_directory/backend-container-app.json"
           jq -n \
             --arg environment_id "$environment_id" \
             --arg identity_id "$BACKEND_IDENTITY_ID" \
@@ -215,20 +233,28 @@ jobs:
                   scale: {minReplicas: 0, maxReplicas: 2}
                 }
               }
-            }' > "$RUNNER_TEMP/backend-container-app.json"
+            }' > "$specification"
+          chmod 0600 "$specification"
+
+          # /health is intentionally process-only and does not verify the Neon connection.
           if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --output none 2>/dev/null; then
             az containerapp update -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" \
-              --yaml "$RUNNER_TEMP/backend-container-app.json" --only-show-errors --output none
+              --yaml "$specification" --only-show-errors --output none
           else
             az containerapp create -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" \
               --environment "$AZURE_CONTAINER_APP_ENVIRONMENT" \
-              --yaml "$RUNNER_TEMP/backend-container-app.json" --only-show-errors --output none
+              --yaml "$specification" --only-show-errors --output none
           fi
-          rm -f "$RUNNER_TEMP/backend-container-app.json"
-          backend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --query properties.configuration.ingress.fqdn -o tsv)"
-          echo "BACKEND_URL=https://$backend_fqdn" >> "$GITHUB_ENV"
 
-      - name: Verify internal Backend health and three official indicators
+          backend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --query properties.configuration.ingress.fqdn -o tsv)"
+          backend_revision="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --query properties.latestRevisionName -o tsv)"
+          {
+            echo "BACKEND_URL=https://$backend_fqdn"
+            echo "BACKEND_FQDN=$backend_fqdn"
+            echo "BACKEND_REVISION=$backend_revision"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify internal Backend health and official indicator APIs
         shell: bash
         run: |
           set -euo pipefail
@@ -241,8 +267,9 @@ jobs:
               --mi-user-assigned "$BACKEND_IDENTITY_ID" --registry-server "$REGISTRY" --registry-identity "$BACKEND_IDENTITY_ID" \
               --env-vars TARGET_URL="$BACKEND_URL" --cpu 0.25 --memory 0.5Gi --only-show-errors --output none
           else
-            az containerapp job update -g "$AZURE_RESOURCE_GROUP" -n "$job" --image "$BACKEND_IMAGE" \
-              --command /smoke-test --replace-env-vars TARGET_URL="$BACKEND_URL" --output none
+            az containerapp job update -g "$AZURE_RESOURCE_GROUP" -n "$job" \
+              --image "$BACKEND_IMAGE" --command /smoke-test \
+              --replace-env-vars TARGET_URL="$BACKEND_URL" --output none
           fi
           execution="$(az containerapp job start -g "$AZURE_RESOURCE_GROUP" -n "$job" --query name -o tsv)"
           for attempt in {1..60}; do
@@ -256,7 +283,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          temporary_directory="$(mktemp -d "$RUNNER_TEMP/kokusei-stage3-frontend.XXXXXX")"
+          cleanup() {
+            rm -rf "$temporary_directory"
+          }
+          trap cleanup EXIT HUP INT TERM
+
           environment_id="$(az containerapp env show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_ENVIRONMENT" --query id -o tsv)"
+          specification="$temporary_directory/frontend-container-app.json"
+          internal_specification="$temporary_directory/frontend-container-app-internal.json"
           jq -n \
             --arg environment_id "$environment_id" \
             --arg identity_id "$FRONTEND_IDENTITY_ID" \
@@ -279,31 +314,47 @@ jobs:
                     name: "frontend",
                     image: $image,
                     resources: {cpu: 0.25, memory: "0.5Gi"},
-                    env: [{name: "INTERNAL_API_URL", value: $backend_url}]
+                    env: [{name: "INTERNAL_API_URL", value: $backend_url}],
+                    probes: [
+                      {type: "Startup", httpGet: {path: "/health", port: 3000}, initialDelaySeconds: 5, periodSeconds: 5, failureThreshold: 10},
+                      {type: "Liveness", httpGet: {path: "/health", port: 3000}, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 3},
+                      {type: "Readiness", httpGet: {path: "/health", port: 3000}, initialDelaySeconds: 5, periodSeconds: 5, failureThreshold: 3}
+                    ]
                   }],
                   scale: {minReplicas: 0, maxReplicas: 2}
                 }
               }
-            }' > "$RUNNER_TEMP/frontend-container-app.json"
+            }' > "$specification"
+
           if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --output none 2>/dev/null; then
             az containerapp update -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" \
-              --yaml "$RUNNER_TEMP/frontend-container-app.json" --only-show-errors --output none
+              --yaml "$specification" --only-show-errors --output none
           else
-            jq '.properties.configuration.ingress.external = false' \
-              "$RUNNER_TEMP/frontend-container-app.json" > "$RUNNER_TEMP/frontend-container-app-internal.json"
+            jq '.properties.configuration.ingress.external = false' "$specification" > "$internal_specification"
             az containerapp create -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" \
               --environment "$AZURE_CONTAINER_APP_ENVIRONMENT" \
-              --yaml "$RUNNER_TEMP/frontend-container-app-internal.json" --only-show-errors --output none
-            initial_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.configuration.ingress.fqdn -o tsv)"
-            [ "https://$initial_fqdn" = "${NEXT_PUBLIC_SITE_URL%/}" ] || { echo "Initial Frontend FQDN does not match NEXT_PUBLIC_SITE_URL; ingress remains internal"; exit 1; }
+              --yaml "$internal_specification" --only-show-errors --output none
             az containerapp update -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" \
-              --yaml "$RUNNER_TEMP/frontend-container-app.json" --only-show-errors --output none
+              --yaml "$specification" --only-show-errors --output none
           fi
-          rm -f "$RUNNER_TEMP/frontend-container-app.json" "$RUNNER_TEMP/frontend-container-app-internal.json"
+
           frontend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.configuration.ingress.fqdn -o tsv)"
           [ "https://$frontend_fqdn" = "${NEXT_PUBLIC_SITE_URL%/}" ] || { echo "Frontend FQDN does not match NEXT_PUBLIC_SITE_URL"; exit 1; }
+          frontend_revision="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.latestRevisionName -o tsv)"
+          {
+            echo "FRONTEND_URL=https://$frontend_fqdn"
+            echo "FRONTEND_REVISION=$frontend_revision"
+          } >> "$GITHUB_ENV"
 
-      - name: Verify public HTTPS pages and metadata
+      - name: Verify Frontend health
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            --retry 12 --retry-all-errors --retry-delay 5 \
+            --output /dev/null "$FRONTEND_URL/health"
+
+      - name: Run public smoke tests
         shell: bash
         run: |
           set -euo pipefail
@@ -318,3 +369,22 @@ jobs:
           printf '%s' "$html" | grep -F "name=\"twitter:image\" content=\"$site/og-image.png\""
           curl --fail --silent --show-error "$site/sitemap.xml" | grep -F "$site/"
           curl --fail --silent --show-error "$site/robots.txt" | grep -F "$site/sitemap.xml"
+
+      - name: Write Stage 3 deployment summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Production Stage 3 completed"
+            echo
+            echo "- Commit SHA: \`$TARGET_COMMIT\`"
+            echo "- Frontend URL: $FRONTEND_URL"
+            echo "- Frontend revision: \`$FRONTEND_REVISION\`"
+            echo "- Frontend digest: \`$FRONTEND_DIGEST\`"
+            echo "- Backend internal FQDN: \`$BACKEND_FQDN\`"
+            echo "- Backend revision: \`$BACKEND_REVISION\`"
+            echo "- Backend digest: \`$BACKEND_DIGEST\`"
+            echo "- Backend health/API validation: succeeded"
+            echo "- Frontend health: succeeded"
+            echo "- Public smoke tests: succeeded"
+          } >> "$GITHUB_STEP_SUMMARY"

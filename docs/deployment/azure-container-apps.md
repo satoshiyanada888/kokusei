@@ -1,6 +1,6 @@
 # Azure Container Apps + Neon 初回公開手順
 
-2026-07-21時点のKOKUSEI本番構成。Neon PostgreSQLの作成、Migration、公式データ検証は完了している。Azure Production Stage 1 applyとGitHub `production` Environment設定は未実施。
+KOKUSEIの初回公開構成。Neon PostgreSQLの作成・実接続検証とAzure Production Stage 1 applyは完了している。Container Apps本体とACR imageはまだ作成していない。GitHub `production` Environmentの実設定は、Workflow実行前に値を表示せず再確認する。
 
 ```text
 利用者
@@ -96,9 +96,9 @@ OIDC identifiersはpasswordではないためVariablesとする。実値を推�
 
 ## Stage 2: imageとDB準備
 
-`.github/workflows/deploy-production.yml`は`workflow_dispatch`のみ。Frontend/Backend検証後、3 imageをRunner上でSHA tag buildする。ACRへpushするのはFrontendとBackendだけで、Migration imageはRunnerにのみ残す。
+`.github/workflows/prepare-production.yml`はStage 2専用の`workflow_dispatch`である。Frontend/Backend検証後、3 imageをRunner上で完全なcommit SHA tagとしてbuildし、platformを`linux/amd64`へ固定する。ACRへpushするのはFrontendとBackendだけで、Migration imageはRunnerにのみ残す。
 
-ACRで両SHA tagを確認後、次の順で進む。
+同じSHA tagが既にACRにある場合は内容にかかわらず上書きせず停止する。push後に両image digestとmanifestのOS・architectureを検証してから、次の順で進む。
 
 1. Neon direct URLでMigration
 2. 出生数import → validation
@@ -108,21 +108,32 @@ ACRで両SHA tagを確認後、次の順で進む。
 
 Migration imageの`schema_migrations`により再実行は安全で、各migrationはtransaction。Importerはindicator単位のtransaction/advisory lockとupsertを使い、同一値は重複せず改訂値だけhistoryを記録する。fixture/mock/sample環境変数を本番Workflowへ渡さない。いずれかが失敗するとshellの`set -e`でApps作成前に停止する。
 
+成功時はcommit SHA、Frontend/Backendのtag付きURI・digest・platform、Migration・Import・Validation結果をjob summaryと30日保持のartifactへ保存する。artifactには接続URL、password、API keyを含めない。Stage 2はContainer Appsを操作せず、Stage 3を起動せずに終了する。
+
 公式系列・checksum・代表値は[出生数・完全失業率](../data-sources/births-and-unemployment.md)と[人口](../data-sources/population.md)を参照。
 
 ## Stage 3: Container Apps公開
 
-Stage 2成功後だけBackendを作成/更新する。
+`.github/workflows/deploy-production.yml`はStage 3専用の別の`workflow_dispatch`である。Stage 2のjob summaryまたはartifactを人が確認し、完全なcommit SHA、Frontend digest、Backend digestを手動入力してRequired Reviewerが承認した場合だけ実行する。Stage 3はDocker buildとACR pushを行わない。
 
-- Backend: internal ingress、port 8080、0.25 vCPU/0.5 GiB、min 0/max 2、non-root、専用Managed IdentityによるACR pull。`/health`をStartup/Liveness/Readiness probeに使う。
+- Stage 3は入力digestがACRに存在し、入力commit SHA tagと対応し、`linux/amd64`であることを再確認する。Container AppsとSmoke Jobはtagではなく`repository@sha256:...`を使用する。
+- Backend: internal ingress、port 8080、0.25 vCPU/0.5 GiB、min 0/max 2、non-root、専用Managed IdentityによるACR pull。`/health`をStartup/Liveness/Readiness probeに使う。現在の`/health`はprocess-onlyで、起動後のDB接続状態は確認しない。
 - `NEON_DATABASE_URL`をAzure Container Apps Secret `neon-database-url`へCLIで登録し、`DATABASE_URL=secretref:neon-database-url`。Terraformへ渡さない。
 - pgx poolは1 replicaあたり最大5接続（最大2 replicaで合計最大10接続）。既定のconnect timeoutとstatement timeoutは各10秒で、URLに明示値があればそれを優先する。起動時DB pingはNeon/Container Apps双方のcold startを考慮して最大約40秒retryする。
 - Backend healthと3詳細APIを同一Container Apps Environment内の一回限りSmoke Jobで確認する。
-- 成功後にFrontendをexternal ingress、port 3000、0.25 vCPU/0.5 GiB、min 0/max 2で作成/更新し、server-side `INTERNAL_API_URL`でBackend internal FQDNへ接続する。ブラウザからBackendへ直接接続しない。
+- 成功後にFrontendをexternal ingress、port 3000、0.25 vCPU/0.5 GiB、min 0/max 2で作成/更新し、server-side `INTERNAL_API_URL`でBackend internal FQDNへ接続する。Frontendの軽量な`/health`をStartup/Liveness/Readiness probeに使用する。ブラウザからBackendへ直接接続しない。
 
-WorkflowはSecret値を含むBackend仕様をRunnerの一時JSONへ生成し、`az containerapp create/update --yaml`へ渡す。JSONはRunner終了時に破棄され、Git、artifact、Terraform、Docker imageへ保存しない。Workflowログにも接続URLを明示出力しない。
+WorkflowはSecret値を含むBackend仕様を権限`0600`の一時ディレクトリへ生成し、`az containerapp create/update --yaml`へ渡す。shellの`trap`で成功・失敗・signalを問わずディレクトリを削除し、Git、artifact、Terraform、Docker imageへ保存しない。Workflowログとjob summaryにも接続URLを出力しない。
 
 Smoke JobはMigration imageではなくBackend imageの`/smoke-test`を使用する。これはACRに既に存在するBackend SHA imageの再利用であり、Migration Container Apps Jobではない。
+
+## Frontend画像最適化の暫定ガード
+
+Next.js 15.5.22のstandalone成果物には`sharp 0.34.5`が含まれ、`GHSA-f88m-g3jw-g9cj`の影響範囲に該当する。KOKUSEIは`next/image`を使用しないが、未緩和のproduction containerではローカル画像を指定した`/_next/image`がHTTP 200となり、実行時に`sharp`がロードされることを確認した。
+
+現在は`next.config.ts`の`images.unoptimized: true`でアプリから画像最適化を利用しないようにし、`middleware.ts`で外部からの`/_next/image`要求を入力内容にかかわらず固定404で拒否する。静的画像は通常の`/og-image.png`などから配信する。Stage 2前のguard testとproduction container試験では、`/health`、トップページ、静的画像が正常応答し、ローカルURL・外部URL・GIF・TIFFを含む画像最適化要求がすべて404となることを確認する。
+
+この制限は、production container内の`sharp`が修正版（少なくとも`0.35.0`）へ更新され、対象Advisoryと`npm audit --omit=dev`を再確認し、同じ実コンテナ試験に合格するまで解除しない。将来`next/image`を導入する場合も、先にこの更新・再検証を行う。
 
 ## NEXT_PUBLIC_SITE_URL初回設定
 
@@ -152,7 +163,7 @@ BudgetはStage 1 apply後、Azure PortalのCost Management > BudgetsでProductio
 
 設計上、Production Remote Stateはprivate Azure Blobを使用し、Neon URLとGitHub SecretはTerraform入力に存在しないためplan/stateへ入らない。Storage AccountはBlob lease lock、versioning、14日削除保持を有効にする。
 
-ただし2026-07-21時点ではBootstrap Resource Groupが削除中で、Remote State用リソースは存在しない。過去のRemote Stateが利用可能、または復旧済みと扱ってはならない。Stage 1 plan前に、Bootstrap Stateの安全な保管場所、復旧元、作成対象、0 destroyであることを別レビューし、private containerへの接続を確認する。
+Bootstrap StateとProduction Stateはprivate Azure Blobへ移行済みで、Azure AD認証とBlob lease lockを使用する。Production StateにはStage 1の15リソースが記録されている。今後もStateをpullして内容を表示したり、Shared Access Key、SAS、接続文字列へ切り替えたりしない。
 
 Storage Account自身を同じStateが管理する循環は残る。Storage削除前にはStateを別backend/暗号化backupへ移す。復旧はBlob Data Contributor権限を戻し、backend.hclを再作成して`terraform init -reconfigure`する。
 

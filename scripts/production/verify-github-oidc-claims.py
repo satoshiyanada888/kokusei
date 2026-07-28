@@ -58,9 +58,14 @@ def main() -> None:
     ):
         fail("GitHub OIDC audience does not match AzureADTokenExchange")
 
-    expected_workflow = (
-        f"{expected['repository']}/.github/workflows/deploy-production.yml@refs/heads/main"
-    )
+    workflow_path = required("EXPECTED_WORKFLOW_PATH")
+    allowed_workflows = {
+        ".github/workflows/prepare-production.yml",
+        ".github/workflows/deploy-production.yml",
+    }
+    if workflow_path not in allowed_workflows:
+        fail("EXPECTED_WORKFLOW_PATH is not an approved production workflow")
+    expected_workflow = f"{expected['repository']}/{workflow_path}@refs/heads/main"
     if payload.get("workflow_ref") != expected_workflow:
         fail("GitHub OIDC token was not issued to the production workflow on main")
 

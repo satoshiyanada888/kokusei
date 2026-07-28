@@ -82,6 +82,6 @@ kokusei-validate-production-data population
 kokusei-validate-production-data all
 ```
 
-失敗時はStage 3を開始しない。既存公式値は削除・全置換されないため、取得失敗時の復旧は原因を修正して同じSHA image/新しいreview済みimageでJobを再実行する。checksum変更時は自動で受け入れず、一次情報レビューを行う。
+失敗時はStage 3を開始しない。既存公式値は削除・全置換されない。Stage 2は既存SHA tagを上書きしないため、取得失敗時は原因を確認し、必要な修正を新しいcommitとしてレビューしてから新しいSHA imageで再実行する。checksum変更時は自動で受け入れず、一次情報レビューを行う。
 
 元データをGitへは保存しない。e-Statから同じdataset/file IDで再取得でき、Importer logのchecksumと照合できる。将来監査要件が高まった場合は、private Azure Blobにraw JSON/Excelとmetadata manifestをimmutable保存するIssueへ分離する。

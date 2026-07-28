@@ -7,20 +7,20 @@
 | Stage | 責務 | 開始条件 | 停止条件 | 再実行・rollback |
 |---|---|---|---|---|
 | 1: Azure基盤 | Resource Group、ACR、Log Analytics、Container Apps Environment、3 Managed Identities、限定RBAC、OIDC Federated Credential | operatorが対象Tenant・Subscription・Remote Stateとsaved planを確認 | planにdestroy/replace、想定外差分、権限・費用不明点がある | 同じsaved planだけをapplyする。失敗時はStateとAzure実体を再planし、推測で再applyしない |
-| 2: image・DB準備 | SHA image build、Frontend/BackendをACRへpush、Migration、3公式import、個別・横断validation | Stage 1成功、GitHub設定完了、Required Reviewer承認、ACR SHA tag確認 | Migration、import、validationのいずれかが失敗 | MigrationとImporterは冪等。同一SHAで再実行できるが、失敗原因とNeon状態を先に確認する |
-| 3: 公開 | internal Backend、内部Smoke Job、external Frontend、公開HTTPS/metadata確認 | Stage 2が同じworkflow runで成功 | Backend health/API、FQDN照合、Frontend smoke testのいずれかが失敗 | Container Apps Multiple revisionsで直前の正常revisionへtrafficを戻す。DBは自動rollbackしない |
+| 2: image・DB準備 | linux/amd64 SHA image build、Frontend/BackendをACRへpush、digest・manifest検証、Migration、3公式import、個別・横断validation | Stage 1成功、GitHub設定完了、Required Reviewer承認、対象SHA tagがACRに存在しない | いずれかのbuild、push、Migration、import、validationが失敗 | 既存SHA tagは上書きせず停止する。失敗原因とACR・Neon状態を確認し、必要なら修正commitで再実行する |
+| 3: 公開 | digest固定のinternal Backend、内部Smoke Job、digest固定のexternal Frontend、公開HTTPS/metadata確認 | Stage 2 artifact・summaryをレビューし、commit SHAと2つのdigestを別の手動実行へ入力してRequired Reviewerが承認 | digestとSHA tagの不一致、Backend health/API、FQDN照合、Frontend health/smoke testのいずれかが失敗 | Container Apps Multiple revisionsで直前の正常revisionへtrafficを戻す。DBは自動rollbackしない |
 
-Stage 2と3は`.github/workflows/deploy-production.yml`のjob依存と`set -euo pipefail`で直列化する。mainの手動実行以外はjob-level guardでskipし、production jobはEnvironment承認を通過するまでSecretとOIDC tokenへ到達しない。
+Stage 2は`.github/workflows/prepare-production.yml`、Stage 3は`.github/workflows/deploy-production.yml`であり、それぞれ独立した`workflow_dispatch`だけを持つ。Stage 2はStage 3を起動せず、Container Apps操作も行わない。両Workflowともmain以外をjob-level guardでskipし、protected jobは`production` Environment承認を通過するまでSecretとOIDC tokenへ到達しない。
 
 ## 値の分類
 
 ### GitHub `production` Environment Secrets
 
-以下はすべて`.github/workflows/deploy-production.yml`のprotected `deploy` jobだけが参照する。
+以下は`production` Environmentで保護する。Stage 2の`prepare` jobは3つすべて、Stage 3の`publish` jobは`NEON_DATABASE_URL`だけを参照する。
 
 | 名前 | 用途 | 設定時期 | 参照箇所 | 未設定時 |
 |---|---|---|---|---|
-| `NEON_DATABASE_URL` | Backend roleのpooled TLS URL | Stage 1後、deploy前 | Stage 2 validation、Backend Container App Secret | guardで停止 |
+| `NEON_DATABASE_URL` | Backend roleのpooled TLS URL | Stage 1後、deploy前 | Stage 2 validation、Stage 3 Backend Container App Secret | guardで停止 |
 | `NEON_MIGRATION_DATABASE_URL` | Migration roleのdirect TLS URL | Stage 1後、deploy前 | Migrationと公式Importer | guardで停止 |
 | `ESTAT_APP_ID` | 出生数e-Stat取得 | Stage 1後、deploy前 | 出生数Importer | guardで停止 |
 
@@ -28,7 +28,7 @@ Stage 2と3は`.github/workflows/deploy-production.yml`のjob依存と`set -euo 
 
 ### GitHub `production` Environment Variables
 
-以下もすべて`.github/workflows/deploy-production.yml`のprotected `deploy` jobだけが参照する。
+以下も`production` Environment Variablesとして管理する。Stage 2はbuild・ACR・DB準備に必要な項目だけを参照し、Stage 3はContainer Apps公開に必要な項目を参照する。
 
 | 名前 | 用途 | 取得元 | 設定時期 | 未設定時 |
 |---|---|---|---|---|
@@ -91,7 +91,7 @@ terraform output -raw expected_frontend_url
 
 ## Stage 1 saved planと初回OIDCの循環
 
-GitHub deploy identityとFederated CredentialはStage 1自身が作成する。このため、初回Stage 1をそのOIDC identityから実行することはできない。初回だけ、既に認証済みのoperatorがRemote Stateを使い、planとapplyを別操作として実行する。2026-07-21時点ではBootstrap Resource Groupが削除中でRemote Stateリソースが存在しないため、Bootstrapを別レビューで復旧し、private backendへの接続を確認するまで次のコマンドを実行しない。
+GitHub deploy identityとFederated CredentialはStage 1自身が作成する。このため、初回Stage 1をそのOIDC identityから実行することはできない。初回だけ、既に認証済みのoperatorがRemote Stateを使い、planとapplyを別操作として実行する。Bootstrap Remote StateとProduction Stage 1は適用済みであり、以後のTerraform変更でもRemote Backend、State件数、saved planを別レビューする。
 
 Plan作成:
 
@@ -122,10 +122,13 @@ terraform apply production-stage1.tfplan
 4. 利用可能ならEnvironment protection ruleのadministrator bypassを無効にする。
 5. 上表のSecretsとVariablesをEnvironment単位で登録する。Repository/Organization Secretへ広げない。
 6. Actions settingsでfork pull requestへSecretを送らない設定を維持する。workflowは`pull_request`と`workflow_call`を持たない。
-7. `Actions > Deploy production > Run workflow`でbranch `main`を選び、confirmationへ正確に`DEPLOY`と入力する。
-8. validate job成功後、Required Reviewerは対象commit SHAと今回の変更内容を確認してdeploy jobを承認する。
+7. `Actions > Prepare production (Stage 2) > Run workflow`でbranch `main`を選び、confirmationへ正確に`PREPARE`と入力する。
+8. validate job成功後、Required Reviewerは対象commit SHAを確認して`prepare` jobを承認する。
+9. Stage 2成功後、artifactまたはjob summaryのcommit SHA、Frontend digest、Backend digest、platform、Migration・Import・Validation結果を確認する。
+10. `Actions > Publish production (Stage 3) > Run workflow`でbranch `main`を選び、確認済みのcommit SHAと2つのdigestを入力し、confirmationへ正確に`PUBLISH`と入力する。
+11. Stage 3のRequired Reviewerは入力値がStage 2結果と一致することを再確認して`publish` jobを承認する。
 
-実行を中止する場合はEnvironment承認を拒否するか、待機中のrunをcancelする。deploy開始後のcancelは途中状態を残し得るため、ACR tag、Neon validation、Container App revisionを確認してから再実行する。concurrencyは`production-deployment`、`cancel-in-progress: false`なので別runが進行中runを中断しない。
+実行を中止する場合はEnvironment承認を拒否するか、待機中のrunをcancelする。Stage 2完了後もStage 3は自動起動しない。protected job開始後のcancelはACR tag、Neon処理、Container App revisionなどの途中状態を残し得るため、実体を確認してから次の対応を判断する。両Workflowのconcurrencyは`production-deployment`、`cancel-in-progress: false`なので相互に並行実行せず、進行中runを中断しない。
 
 ## OIDCとAzure RBAC
 
@@ -133,7 +136,7 @@ terraform apply production-stage1.tfplan
 - Issuer: `https://token.actions.githubusercontent.com`
 - Audience: `api://AzureADTokenExchange`
 - Subject: `repo:satoshiyanada888/kokusei:environment:production`
-- GitHub permissions: deploy jobだけ`id-token: write`、全jobは`contents: read`
+- GitHub permissions: Stage 2の`prepare` jobとStage 3の`publish` jobだけ`id-token: write`、全jobは`contents: read`
 - Environmentとbranch: OIDC subjectはEnvironmentを限定し、GitHub job guardとdeployment branch ruleでmainを重ねて制限する
 
 Repositoryは2026-07-15 03:15 UTC作成で、2026-07-21確認時点のOIDC customization APIは`use_default=true`、`use_immutable_subject=false`である。そのため、現行Terraformはlegacy Environment subjectを使用する。将来のopt-inやrepository移管でsubject形式が変わった場合に備え、deploy workflowはAzure login前にGitHubから実際のOIDC tokenを取得し、tokenをログへ出さず`github_actions_federated_subject`、issuer、audience、repository、environment、main ref、commit SHA、`workflow_ref`を完全一致検証する。不一致時はAzure login前に停止し、Federated Credentialを広く緩和せず、実claimに合わせたTerraform変更を別planでレビューする。
@@ -165,11 +168,12 @@ az role assignment list --assignee <principal-id> --all -o table
 1. Stage 1 saved planのadd/change/destroy/replace、commit SHA、料金対象を確認してapplyする。
 2. outputをEnvironment Variablesへ登録し、Secrets、Required Reviewer、main ruleを設定する。
 3. Azure OIDC Federated CredentialとRBAC scopeを読み取り確認する。
-4. mainから手動workflowを開始する。validate jobはSecretなしでlint/test/build/guardを実行する。
-5. Environment承認後、deploy jobがOIDC login、SHA image push、Stage 2、Stage 3を順番に実行する。
-6. ACRにはFrontend/Backendの完全なcommit SHA tagが存在すること、Migration imageはRunner内だけであることを確認する。
-7. Migration・公式データvalidation成功後だけBackendを作り、内部Smoke成功後だけFrontendをexternalにする。
-8. HTTPS主要画面、canonical、OGP、sitemap、robotsを確認する。
+4. mainからStage 2を手動実行する。validate jobはSecretなしでlint/test/build/guardを実行する。
+5. Stage 2のEnvironment承認後、prepare jobがOIDC login、linux/amd64 SHA image push、digest・manifest確認、Migration・公式Import・Validationを実行して停止する。
+6. artifactとjob summaryで、完全なcommit SHA、Frontend/Backend URI・digest、`linux/amd64`、DB処理成功を確認する。ACRには完全なSHA tagだけがあり、Migration imageはRunner内だけであることも確認する。
+7. Stage 3を別途手動実行し、確認済みcommit SHAと2つのdigestを入力する。Stage 3のEnvironment承認前に入力値を再照合する。
+8. Stage 3はACR上でdigestの存在、SHA tagとの対応、platformを再検証し、タグではなくdigestでBackendを作成する。
+9. Backend内部Smoke成功後だけFrontendをexternalにし、Frontend health、HTTPS主要画面、canonical、OGP、sitemap、robotsを確認する。
 
 Planでは、対象Subscription/RG、15 add、0 change、0 destroy、0 replace、Azure DB/VNet/Private DNS/Container Appsが含まれないことを確認する。件数が変わった場合は中止して再レビューする。
 

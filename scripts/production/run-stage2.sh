@@ -11,8 +11,8 @@ scripts/production/validate-neon-urls.py
 docker image inspect "$MIGRATION_IMAGE" >/dev/null
 docker image inspect "$BACKEND_IMAGE" >/dev/null
 
-docker run --rm \
-  --env DATABASE_URL="$NEON_MIGRATION_DATABASE_URL" \
+DATABASE_URL="$NEON_MIGRATION_DATABASE_URL" docker run --rm \
+  --env DATABASE_URL \
   --env APP_DATABASE_USER="$APP_DATABASE_USER" \
   --env LOAD_PRODUCTION_CATALOG=true \
   "$MIGRATION_IMAGE"
@@ -20,8 +20,8 @@ docker run --rm \
 run_import() {
   local command=$1
   shift
-  docker run --rm \
-    --env DATABASE_URL="$NEON_MIGRATION_DATABASE_URL" \
+  DATABASE_URL="$NEON_MIGRATION_DATABASE_URL" docker run --rm \
+    --env DATABASE_URL \
     --env IMPORTER_VERSION="$GITHUB_SHA" \
     "$@" \
     --entrypoint "$command" \
@@ -30,8 +30,8 @@ run_import() {
 
 run_validation() {
   local target=$1
-  docker run --rm \
-    --env DATABASE_URL="$NEON_DATABASE_URL" \
+  DATABASE_URL="$NEON_DATABASE_URL" docker run --rm \
+    --env DATABASE_URL \
     --entrypoint /usr/local/bin/kokusei-validate-production-data \
     "$MIGRATION_IMAGE" "$target"
 }

@@ -1,10 +1,16 @@
 #!/bin/sh
+# Literal shell fragments are intentionally single-quoted for exact guard matching.
+# shellcheck disable=SC2016
 set -eu
 
-workflow=.github/workflows/deploy-production.yml
+stage2_workflow=.github/workflows/prepare-production.yml
+stage3_workflow=.github/workflows/deploy-production.yml
 stage2=scripts/production/run-stage2.sh
 url_validator=scripts/production/validate-neon-urls.py
 oidc_validator=scripts/production/verify-github-oidc-claims.py
+platform_verifier=scripts/production/verify-image-platform.sh
+frontend_config=frontend/next.config.ts
+frontend_middleware=frontend/middleware.ts
 
 require() {
   pattern=$1
@@ -15,30 +21,152 @@ require() {
   }
 }
 
-require "workflow_dispatch:" "$workflow"
-require "if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'" "$workflow"
-require "name: production" "$workflow"
-require "cancel-in-progress: false" "$workflow"
-require "id-token: write" "$workflow"
-require "AZURE_FEDERATED_SUBJECT" "$workflow"
-require "NEON_DATABASE_URL" "$workflow"
-require "NEON_MIGRATION_DATABASE_URL" "$workflow"
-require "FRONTEND_IDENTITY_ID" "$workflow"
-require "BACKEND_IDENTITY_ID" "$workflow"
-require "Required production setting is missing" "$workflow"
-require "scripts/production/validate-neon-urls.py" "$workflow"
-require "Production target commit: \$GITHUB_SHA" "$workflow"
-require "scripts/production/verify-github-oidc-claims.py" "$workflow"
-require "Authenticate to Azure with verified OIDC" "$workflow"
-require "az acr manifest show-metadata" "$workflow"
-require "Migrate Neon, import official data, and validate" "$workflow"
-require "Create or update internal Backend" "$workflow"
-require 'path: "/health"' "$workflow"
-require 'external: false' "$workflow"
-require "Backend health/API validation failed" "$workflow"
-require "Create or update Frontend after Backend validation" "$workflow"
-require 'external: true' "$workflow"
-require 'ingress remains internal' "$workflow"
+require_manual_only() {
+  workflow=$1
+  require "workflow_dispatch:" "$workflow"
+  require "if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'" "$workflow"
+  require "name: production" "$workflow"
+  require "cancel-in-progress: false" "$workflow"
+
+  if grep -E '^  (push|pull_request|pull_request_target|workflow_call|workflow_run|schedule):' "$workflow" >/dev/null; then
+    echo "$workflow must only be triggered by workflow_dispatch" >&2
+    exit 1
+  fi
+}
+
+require_manual_only "$stage2_workflow"
+require_manual_only "$stage3_workflow"
+
+require "GHSA-f88m-g3jw-g9cj" "$frontend_config"
+require "unoptimized: true" "$frontend_config"
+require "GHSA-f88m-g3jw-g9cj" "$frontend_middleware"
+require "status: 404" "$frontend_middleware"
+require 'matcher: "/_next/image"' "$frontend_middleware"
+
+require "PREPARE" "$stage2_workflow"
+require "Build linux/amd64 application and migration images" "$stage2_workflow"
+require "docker buildx build --platform linux/amd64 --load" "$stage2_workflow"
+require "Refuse to overwrite an existing commit SHA tag" "$stage2_workflow"
+require "Refusing to overwrite existing ACR tag" "$stage2_workflow"
+require 'frontend_image="$registry/frontend:$GITHUB_SHA"' "$stage2_workflow"
+require 'backend_image="$registry/backend:$GITHUB_SHA"' "$stage2_workflow"
+require 'docker push "$frontend_image"' "$stage2_workflow"
+require 'docker push "$backend_image"' "$stage2_workflow"
+require "az acr manifest show-metadata" "$stage2_workflow"
+require "scripts/production/verify-image-platform.sh" "$stage2_workflow"
+require "Frontend manifest must be linux/amd64" "$stage2_workflow"
+require "Backend manifest must be linux/amd64" "$stage2_workflow"
+require "Migrate Neon, import official data, and validate" "$stage2_workflow"
+require "scripts/production/run-stage2.sh" "$stage2_workflow"
+require "actions/upload-artifact@v4" "$stage2_workflow"
+require "production-stage2-\${{ github.sha }}" "$stage2_workflow"
+require "Stage 3 was not started" "$stage2_workflow"
+require "EXPECTED_WORKFLOW_PATH: .github/workflows/prepare-production.yml" "$stage2_workflow"
+
+if grep -E '\baz containerapp (create|update|revision|ingress|job|secret|update|delete)\b' "$stage2_workflow" >/dev/null; then
+  echo "Stage 2 must not create or update Container Apps, jobs, revisions, traffic, or secrets" >&2
+  exit 1
+fi
+
+if grep -E '(workflow_run|gh workflow run|actions/github-script.*workflow)' "$stage2_workflow" >/dev/null; then
+  echo "Stage 2 must not start Stage 3 automatically" >&2
+  exit 1
+fi
+
+require "commit_sha:" "$stage3_workflow"
+require "frontend_image_digest:" "$stage3_workflow"
+require "backend_image_digest:" "$stage3_workflow"
+require "PUBLISH" "$stage3_workflow"
+require "git merge-base --is-ancestor" "$stage3_workflow"
+require 'FRONTEND_IMAGE=$registry/frontend@$FRONTEND_DIGEST' "$stage3_workflow"
+require 'BACKEND_IMAGE=$registry/backend@$BACKEND_DIGEST' "$stage3_workflow"
+require "digest is not tagged with the requested commit SHA" "$stage3_workflow"
+require "scripts/production/verify-image-platform.sh" "$stage3_workflow"
+require "Create or update internal Backend" "$stage3_workflow"
+require 'external: false' "$stage3_workflow"
+require "Create or update Frontend after Backend validation" "$stage3_workflow"
+require 'external: true' "$stage3_workflow"
+require 'path: "/health", port: 8080' "$stage3_workflow"
+require 'path: "/health", port: 3000' "$stage3_workflow"
+require "/health is intentionally process-only" "$stage3_workflow"
+require "trap cleanup EXIT HUP INT TERM" "$stage3_workflow"
+require "chmod 0600" "$stage3_workflow"
+require "Verify Frontend health" "$stage3_workflow"
+require "Run public smoke tests" "$stage3_workflow"
+require "Write Stage 3 deployment summary" "$stage3_workflow"
+require "EXPECTED_WORKFLOW_PATH: .github/workflows/deploy-production.yml" "$stage3_workflow"
+
+if grep -E '(^|[[:space:]])docker (build|push)([[:space:]]|$)|docker buildx build' "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 must not build or push Docker images" >&2
+  exit 1
+fi
+
+if grep -F "scripts/production/run-stage2.sh" "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 must not run Migration or official data import" >&2
+  exit 1
+fi
+
+if grep -E 'NEON_MIGRATION_DATABASE_URL|ESTAT_APP_ID' "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 must not read Migration or importer secrets" >&2
+  exit 1
+fi
+
+for workflow in "$stage2_workflow" "$stage3_workflow"; do
+  if [ "$(grep -c 'id-token: write' "$workflow")" -ne 1 ]; then
+    echo "Only one protected job in $workflow may request an OIDC token" >&2
+    exit 1
+  fi
+done
+
+if grep -F 'set -x' "$stage2_workflow" "$stage3_workflow" "$stage2" "$url_validator" "$oidc_validator" "$platform_verifier" >/dev/null; then
+  echo "Production workflows and scripts must not enable shell tracing" >&2
+  exit 1
+fi
+
+require "docker buildx imagetools inspect" "$platform_verifier"
+require "only linux/amd64 runtime platforms" "$platform_verifier"
+
+if grep -E 'docker (build|buildx build) .*\b(NEON_DATABASE_URL|NEON_MIGRATION_DATABASE_URL|ESTAT_APP_ID)\b' "$stage2_workflow" >/dev/null; then
+  echo "Production secrets must not be passed as Docker build arguments" >&2
+  exit 1
+fi
+
+if grep -E '(:latest|/latest)' "$stage2_workflow" "$stage3_workflow" "$stage2" >/dev/null; then
+  echo "Production workflows must not use a latest image tag" >&2
+  exit 1
+fi
+
+if grep -F 'docker push "$MIGRATION_IMAGE"' "$stage2_workflow" "$stage2" >/dev/null; then
+  echo "Migration image must not be pushed to ACR" >&2
+  exit 1
+fi
+
+if grep -E '(echo|printf).*(NEON_DATABASE_URL|NEON_MIGRATION_DATABASE_URL|DATABASE_URL)' "$stage2_workflow" "$stage3_workflow" "$stage2" >/dev/null; then
+  echo "Production secrets must not be written to logs or summaries" >&2
+  exit 1
+fi
+
+if grep -F -- '--env DATABASE_URL=' "$stage2_workflow" "$stage3_workflow" "$stage2" >/dev/null; then
+  echo "Database URLs must not be placed in Docker command arguments" >&2
+  exit 1
+fi
+
+manifest_line=$(grep -n -m1 'Resolve digests and verify linux/amd64 manifests' "$stage2_workflow" | cut -d: -f1)
+database_line=$(grep -n -m1 'Migrate Neon, import official data, and validate' "$stage2_workflow" | cut -d: -f1)
+metadata_line=$(grep -n -m1 'Write safe Stage 2 metadata' "$stage2_workflow" | cut -d: -f1)
+[ "$manifest_line" -lt "$database_line" ] || { echo "Manifest validation must precede database changes" >&2; exit 1; }
+[ "$database_line" -lt "$metadata_line" ] || { echo "Successful database validation must precede Stage 2 metadata" >&2; exit 1; }
+
+backend_line=$(grep -n -m1 'Create or update internal Backend' "$stage3_workflow" | cut -d: -f1)
+backend_verify_line=$(grep -n -m1 'Verify internal Backend health' "$stage3_workflow" | cut -d: -f1)
+frontend_line=$(grep -n -m1 'Create or update Frontend after Backend validation' "$stage3_workflow" | cut -d: -f1)
+frontend_health_line=$(grep -n -m1 'Verify Frontend health' "$stage3_workflow" | cut -d: -f1)
+smoke_line=$(grep -n -m1 'Run public smoke tests' "$stage3_workflow" | cut -d: -f1)
+[ "$backend_line" -lt "$backend_verify_line" ] || { echo "Backend deployment must precede internal health validation" >&2; exit 1; }
+[ "$backend_verify_line" -lt "$frontend_line" ] || { echo "Backend validation must precede Frontend deployment" >&2; exit 1; }
+[ "$frontend_line" -lt "$frontend_health_line" ] || { echo "Frontend deployment must precede Frontend health validation" >&2; exit 1; }
+[ "$frontend_health_line" -lt "$smoke_line" ] || { echo "Frontend health must precede public smoke tests" >&2; exit 1; }
+
 require "docker image inspect" "$stage2"
 require "/import-births" "$stage2"
 require "run_validation births" "$stage2"
@@ -50,58 +178,12 @@ require "run_validation all" "$stage2"
 require 'pooled=True' "$url_validator"
 require 'pooled=False' "$url_validator"
 require 'ALLOWED_SSL_MODES = {"require", "verify-ca", "verify-full"}' "$url_validator"
-
-if grep -E '^  (push|pull_request|pull_request_target|workflow_call|schedule):' "$workflow" >/dev/null; then
-  echo "Production workflow must only be triggered by workflow_dispatch" >&2
-  exit 1
-fi
-
-if [ "$(grep -c 'id-token: write' "$workflow")" -ne 1 ]; then
-  echo "Only the production deploy job may request an OIDC token" >&2
-  exit 1
-fi
-
-if grep -F 'set -x' "$workflow" "$stage2" "$url_validator" "$oidc_validator" >/dev/null; then
-  echo "Production scripts must not enable shell tracing" >&2
-  exit 1
-fi
-
-if grep -E 'docker build .*\b(NEON_DATABASE_URL|NEON_MIGRATION_DATABASE_URL|ESTAT_APP_ID)\b' "$workflow" >/dev/null; then
-  echo "Production secrets must not be passed as Docker build arguments" >&2
-  exit 1
-fi
-
-if grep -E '(:latest|/latest)' "$workflow" "$stage2" >/dev/null; then
-  echo "Production workflow must not use a latest image tag" >&2
-  exit 1
-fi
-
-if grep -F 'docker push "$MIGRATION_IMAGE"' "$workflow" "$stage2" >/dev/null; then
-  echo "Migration image must not be pushed to ACR" >&2
-  exit 1
-fi
-
-manifest_line=$(grep -n -m1 'az acr manifest show-metadata' "$workflow" | cut -d: -f1)
-stage2_line=$(grep -n -m1 'Migrate Neon, import official data, and validate' "$workflow" | cut -d: -f1)
-backend_line=$(grep -n -m1 'Create or update internal Backend' "$workflow" | cut -d: -f1)
-backend_verify_line=$(grep -n -m1 'Verify internal Backend health' "$workflow" | cut -d: -f1)
-frontend_line=$(grep -n -m1 'Create or update Frontend after Backend validation' "$workflow" | cut -d: -f1)
-deploy_line=$(grep -n -m1 '^  deploy:' "$workflow" | cut -d: -f1)
-environment_line=$(grep -n -m1 '^    environment:' "$workflow" | cut -d: -f1)
-first_secret_line=$(grep -n -m1 'secrets\.' "$workflow" | cut -d: -f1)
-
-[ "$manifest_line" -lt "$stage2_line" ] || { echo "ACR verification must precede database changes" >&2; exit 1; }
-[ "$stage2_line" -lt "$backend_line" ] || { echo "Database validation must precede Backend deployment" >&2; exit 1; }
-[ "$backend_line" -lt "$backend_verify_line" ] || { echo "Backend creation must precede health validation" >&2; exit 1; }
-[ "$backend_verify_line" -lt "$frontend_line" ] || { echo "Backend validation must precede Frontend deployment" >&2; exit 1; }
-[ "$deploy_line" -lt "$environment_line" ] && [ "$environment_line" -lt "$first_secret_line" ] || {
-  echo "Production secrets must only be referenced by the protected deploy job" >&2
-  exit 1
-}
+require 'NEON_URL_VALIDATION_MODE' "$url_validator"
 
 valid_backend='postgresql://kokusei_backend:example@ep-example-pooler.ap-southeast-1.aws.neon.tech/kokusei?sslmode=require&channel_binding=require'
 valid_migration='postgresql://kokusei_migration:example@ep-example.ap-southeast-1.aws.neon.tech/kokusei?sslmode=require&channel_binding=require'
 NEON_DATABASE_URL="$valid_backend" NEON_MIGRATION_DATABASE_URL="$valid_migration" "$url_validator" >/dev/null
+NEON_DATABASE_URL="$valid_backend" NEON_URL_VALIDATION_MODE=backend "$url_validator" >/dev/null
 
 if NEON_DATABASE_URL="$valid_migration" NEON_MIGRATION_DATABASE_URL="$valid_backend" "$url_validator" >/dev/null 2>&1; then
   echo "Neon URL validator accepted reversed pooled/direct endpoints" >&2
@@ -109,7 +191,7 @@ if NEON_DATABASE_URL="$valid_migration" NEON_MIGRATION_DATABASE_URL="$valid_back
 fi
 
 disabled_backend=$(printf '%s' "$valid_backend" | sed 's/sslmode=require/sslmode=disable/')
-if NEON_DATABASE_URL="$disabled_backend" NEON_MIGRATION_DATABASE_URL="$valid_migration" "$url_validator" >/dev/null 2>&1; then
+if NEON_DATABASE_URL="$disabled_backend" NEON_URL_VALIDATION_MODE=backend "$url_validator" >/dev/null 2>&1; then
   echo "Neon URL validator accepted disabled TLS" >&2
   exit 1
 fi
@@ -117,15 +199,27 @@ fi
 repository=satoshiyanada888/kokusei
 commit=0123456789abcdef0123456789abcdef01234567
 subject="repo:$repository:environment:production"
-oidc_token=$(
-  python3 -c 'import base64,json,sys; encode=lambda value: base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("="); print(encode({"alg":"none"})+"."+encode(json.loads(sys.argv[1]))+".")' \
-    "{\"iss\":\"https://token.actions.githubusercontent.com\",\"sub\":\"$subject\",\"repository\":\"$repository\",\"environment\":\"production\",\"ref\":\"refs/heads/main\",\"sha\":\"$commit\",\"event_name\":\"workflow_dispatch\",\"aud\":\"api://AzureADTokenExchange\",\"workflow_ref\":\"$repository/.github/workflows/deploy-production.yml@refs/heads/main\"}"
-)
-OIDC_TOKEN="$oidc_token" EXPECTED_OIDC_SUBJECT="$subject" GITHUB_REPOSITORY="$repository" GITHUB_SHA="$commit" "$oidc_validator" >/dev/null
 
-if OIDC_TOKEN="$oidc_token" EXPECTED_OIDC_SUBJECT="repo:wrong/repository:environment:production" GITHUB_REPOSITORY="$repository" GITHUB_SHA="$commit" "$oidc_validator" >/dev/null 2>&1; then
+verify_oidc_workflow() {
+  workflow_path=$1
+  oidc_token=$(
+    python3 -c 'import base64,json,sys; encode=lambda value: base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("="); print(encode({"alg":"none"})+"."+encode(json.loads(sys.argv[1]))+".")' \
+      "{\"iss\":\"https://token.actions.githubusercontent.com\",\"sub\":\"$subject\",\"repository\":\"$repository\",\"environment\":\"production\",\"ref\":\"refs/heads/main\",\"sha\":\"$commit\",\"event_name\":\"workflow_dispatch\",\"aud\":\"api://AzureADTokenExchange\",\"workflow_ref\":\"$repository/$workflow_path@refs/heads/main\"}"
+  )
+  OIDC_TOKEN="$oidc_token" EXPECTED_OIDC_SUBJECT="$subject" EXPECTED_WORKFLOW_PATH="$workflow_path" GITHUB_REPOSITORY="$repository" GITHUB_SHA="$commit" "$oidc_validator" >/dev/null
+}
+
+verify_oidc_workflow .github/workflows/prepare-production.yml
+verify_oidc_workflow .github/workflows/deploy-production.yml
+
+if OIDC_TOKEN="$oidc_token" EXPECTED_OIDC_SUBJECT="repo:wrong/repository:environment:production" EXPECTED_WORKFLOW_PATH=.github/workflows/deploy-production.yml GITHUB_REPOSITORY="$repository" GITHUB_SHA="$commit" "$oidc_validator" >/dev/null 2>&1; then
   echo "OIDC claim validator accepted a mismatched federated subject" >&2
   exit 1
 fi
 
-echo "Production workflow guards are present"
+if OIDC_TOKEN="$oidc_token" EXPECTED_OIDC_SUBJECT="$subject" EXPECTED_WORKFLOW_PATH=.github/workflows/unapproved.yml GITHUB_REPOSITORY="$repository" GITHUB_SHA="$commit" "$oidc_validator" >/dev/null 2>&1; then
+  echo "OIDC claim validator accepted an unapproved workflow path" >&2
+  exit 1
+fi
+
+echo "Production Stage 2 and Stage 3 workflow guards are present"

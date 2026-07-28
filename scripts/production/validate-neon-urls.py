@@ -49,6 +49,13 @@ def parse_url(name: str, *, pooled: bool) -> tuple[str, str]:
 
 def main() -> None:
     backend_host, backend_user = parse_url("NEON_DATABASE_URL", pooled=True)
+    mode = os.environ.get("NEON_URL_VALIDATION_MODE", "pair")
+    if mode == "backend":
+        print("Neon Backend URL role and TLS settings are valid")
+        return
+    if mode != "pair":
+        fail("NEON_URL_VALIDATION_MODE must be pair or backend")
+
     migration_host, migration_user = parse_url(
         "NEON_MIGRATION_DATABASE_URL", pooled=False
     )
