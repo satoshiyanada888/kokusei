@@ -98,6 +98,8 @@ OIDC identifiersはpasswordではないためVariablesとする。実値を推�
 
 `.github/workflows/prepare-production.yml`はStage 2専用の`workflow_dispatch`である。Frontend/Backend検証後、3 imageをRunner上で完全なcommit SHA tagとしてbuildし、platformを`linux/amd64`へ固定する。ACRへpushするのはFrontendとBackendだけで、Migration imageはRunnerにのみ残す。
 
+実行前にGitHub上の`main` HEADが事前レビュー済みcommitと一致することを確認し、40文字の完全SHAを`expected_commit_sha`へ入力する。短縮SHAや既定値は使用しない。Environment承認前のvalidate jobが入力形式を確認し、大小文字を正規化したうえで`github.sha`と完全一致しなければ停止する。事前レビューしたSHA以外のrunは承認しない。
+
 同じSHA tagが既にACRにある場合は内容にかかわらず上書きせず停止する。push後に両image digestとmanifestのOS・architectureを検証してから、次の順で進む。
 
 1. Neon direct URLでMigration

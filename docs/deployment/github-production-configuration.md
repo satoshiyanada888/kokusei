@@ -122,11 +122,12 @@ terraform apply production-stage1.tfplan
 4. 利用可能ならEnvironment protection ruleのadministrator bypassを無効にする。
 5. 上表のSecretsとVariablesをEnvironment単位で登録する。Repository/Organization Secretへ広げない。
 6. Actions settingsでfork pull requestへSecretを送らない設定を維持する。workflowは`pull_request`と`workflow_call`を持たない。
-7. `Actions > Prepare production (Stage 2) > Run workflow`でbranch `main`を選び、confirmationへ正確に`PREPARE`と入力する。
-8. validate job成功後、Required Reviewerは対象commit SHAを確認して`prepare` jobを承認する。
-9. Stage 2成功後、artifactまたはjob summaryのcommit SHA、Frontend digest、Backend digest、platform、Migration・Import・Validation結果を確認する。
-10. `Actions > Publish production (Stage 3) > Run workflow`でbranch `main`を選び、確認済みのcommit SHAと2つのdigestを入力し、confirmationへ正確に`PUBLISH`と入力する。
-11. Stage 3のRequired Reviewerは入力値がStage 2結果と一致することを再確認して`publish` jobを承認する。
+7. GitHub上の`main` HEADを確認して、事前レビュー済みcommitの40文字完全SHAを取得する。短縮SHAは使用しない。
+8. `Actions > Prepare production (Stage 2) > Run workflow`でbranch `main`を選び、`expected_commit_sha`へ確認済み完全SHA、confirmationへ正確に`PREPARE`と入力する。dispatchされた`github.sha`と一致しなければvalidate jobがEnvironment承認前に停止する。
+9. validate job成功後、Required Reviewerは対象commit SHAを再確認して`prepare` jobを承認する。事前レビューしたSHA以外は承認しない。
+10. Stage 2成功後、artifactまたはjob summaryのcommit SHA、Frontend digest、Backend digest、platform、Migration・Import・Validation結果を確認する。
+11. `Actions > Publish production (Stage 3) > Run workflow`でbranch `main`を選び、確認済みのcommit SHAと2つのdigestを入力し、confirmationへ正確に`PUBLISH`と入力する。
+12. Stage 3のRequired Reviewerは入力値がStage 2結果と一致することを再確認して`publish` jobを承認する。
 
 実行を中止する場合はEnvironment承認を拒否するか、待機中のrunをcancelする。Stage 2完了後もStage 3は自動起動しない。protected job開始後のcancelはACR tag、Neon処理、Container App revisionなどの途中状態を残し得るため、実体を確認してから次の対応を判断する。両Workflowのconcurrencyは`production-deployment`、`cancel-in-progress: false`なので相互に並行実行せず、進行中runを中断しない。
 
@@ -168,7 +169,7 @@ az role assignment list --assignee <principal-id> --all -o table
 1. Stage 1 saved planのadd/change/destroy/replace、commit SHA、料金対象を確認してapplyする。
 2. outputをEnvironment Variablesへ登録し、Secrets、Required Reviewer、main ruleを設定する。
 3. Azure OIDC Federated CredentialとRBAC scopeを読み取り確認する。
-4. mainからStage 2を手動実行する。validate jobはSecretなしでlint/test/build/guardを実行する。
+4. GitHub上のmain HEADを確認し、その40文字完全SHAを`expected_commit_sha`へ入力してStage 2を手動実行する。validate jobはSecretなしで入力SHAと`github.sha`の完全一致、lint/test/build/guardを確認する。
 5. Stage 2のEnvironment承認後、prepare jobがOIDC login、linux/amd64 SHA image push、digest・manifest確認、Migration・公式Import・Validationを実行して停止する。
 6. artifactとjob summaryで、完全なcommit SHA、Frontend/Backend URI・digest、`linux/amd64`、DB処理成功を確認する。ACRには完全なSHA tagだけがあり、Migration imageはRunner内だけであることも確認する。
 7. Stage 3を別途手動実行し、確認済みcommit SHAと2つのdigestを入力する。Stage 3のEnvironment承認前に入力値を再照合する。

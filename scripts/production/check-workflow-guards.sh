@@ -37,6 +37,86 @@ require_manual_only() {
 require_manual_only "$stage2_workflow"
 require_manual_only "$stage3_workflow"
 
+expected_commit_input=$(
+  awk '
+    /^      expected_commit_sha:$/ { capture = 1; next }
+    capture && /^      [A-Za-z0-9_]+:$/ { exit }
+    capture && !/^        / { exit }
+    capture { print }
+  ' "$stage2_workflow"
+)
+printf '%s\n' "$expected_commit_input" | grep -F "required: true" >/dev/null || {
+  echo "Stage 2 expected_commit_sha input must be required" >&2
+  exit 1
+}
+printf '%s\n' "$expected_commit_input" | grep -F "type: string" >/dev/null || {
+  echo "Stage 2 expected_commit_sha input must be a string" >&2
+  exit 1
+}
+if printf '%s\n' "$expected_commit_input" | grep -F "default:" >/dev/null; then
+  echo "Stage 2 expected_commit_sha input must not define a default" >&2
+  exit 1
+fi
+
+require "Validate reviewed commit SHA" "$stage2_workflow"
+require 'EXPECTED_COMMIT_SHA: ${{ github.event.inputs.expected_commit_sha }}' "$stage2_workflow"
+require 'ACTUAL_COMMIT_SHA: ${{ github.sha }}' "$stage2_workflow"
+require '[[ "$EXPECTED_COMMIT_SHA" =~ ^[0-9a-fA-F]{40}$ ]]' "$stage2_workflow"
+require 'if [ "$normalized_expected" != "$normalized_actual" ]; then' "$stage2_workflow"
+require "Expected commit SHA does not match the dispatched workflow SHA." "$stage2_workflow"
+require "needs: validate" "$stage2_workflow"
+
+commit_validation_line=$(grep -n -m1 'Validate reviewed commit SHA' "$stage2_workflow" | cut -d: -f1)
+protected_job_line=$(grep -n -m1 '^  prepare:$' "$stage2_workflow" | cut -d: -f1)
+[ "$commit_validation_line" -lt "$protected_job_line" ] || {
+  echo "Stage 2 commit validation must run before the protected prepare job" >&2
+  exit 1
+}
+
+validate_commit_pair() {
+  expected=$1
+  actual=$2
+  [ "${#expected}" -eq 40 ] || return 1
+  case "$expected" in
+    *[!0-9a-fA-F]*) return 1 ;;
+  esac
+  normalized_expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+  normalized_actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  [ "$normalized_expected" = "$normalized_actual" ]
+}
+
+reviewed_sha=0123456789abcdef0123456789abcdef01234567
+uppercase_sha=0123456789ABCDEF0123456789ABCDEF01234567
+validate_commit_pair "$reviewed_sha" "$reviewed_sha" || {
+  echo "Stage 2 commit validation rejected a matching SHA" >&2
+  exit 1
+}
+validate_commit_pair "$uppercase_sha" "$reviewed_sha" || {
+  echo "Stage 2 commit validation rejected a case-equivalent SHA" >&2
+  exit 1
+}
+if validate_commit_pair "$reviewed_sha" 1123456789abcdef0123456789abcdef01234567; then
+  echo "Stage 2 commit validation accepted a mismatched SHA" >&2
+  exit 1
+fi
+
+invalid_with_newline=$(printf '%s\nx' "$reviewed_sha")
+for invalid_sha in \
+  "" \
+  01234567 \
+  0123456789abcdef0123456789abcdef0123456 \
+  0123456789abcdef0123456789abcdef012345678 \
+  0123456789abcdef0123456789abcdef0123456g \
+  " $reviewed_sha" \
+  "$reviewed_sha " \
+  "$invalid_with_newline"
+do
+  if validate_commit_pair "$invalid_sha" "$reviewed_sha"; then
+    echo "Stage 2 commit validation accepted an invalid SHA" >&2
+    exit 1
+  fi
+done
+
 require "GHSA-f88m-g3jw-g9cj" "$frontend_config"
 require "unoptimized: true" "$frontend_config"
 require "GHSA-f88m-g3jw-g9cj" "$frontend_middleware"
