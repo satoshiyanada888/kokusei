@@ -1,8 +1,9 @@
 locals {
-  compact_prefix      = replace(var.name_prefix, "-", "")
-  frontend_app_name   = "${var.name_prefix}-frontend"
-  backend_app_name    = "${var.name_prefix}-backend"
-  github_oidc_subject = "repo:${var.github_repository}:environment:${var.github_environment}"
+  compact_prefix          = replace(var.name_prefix, "-", "")
+  frontend_app_name       = "${var.name_prefix}-frontend"
+  backend_app_name        = "${var.name_prefix}-backend"
+  github_repository_parts = split("/", var.github_repository)
+  github_oidc_subject     = "repo:${local.github_repository_parts[0]}@${var.github_repository_owner_id}/${local.github_repository_parts[1]}@${var.github_repository_id}:environment:${var.github_environment}"
 }
 
 resource "random_string" "global_suffix" {

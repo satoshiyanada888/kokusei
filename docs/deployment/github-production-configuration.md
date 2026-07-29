@@ -86,6 +86,8 @@ terraform output -raw expected_frontend_url
 |---|---|---|
 | `production` | GitHub Environment、OIDC context | 非機密 |
 | `satoshiyanada888/kokusei` | OIDC repository制約 | 非機密 |
+| `16567805` | OIDC subjectのGitHub owner ID | 非機密 |
+| `1301151718` | OIDC subjectのGitHub repository ID | 非機密 |
 | `api://AzureADTokenExchange` | OIDC audience | 非機密 |
 | e-Stat人口統計表ID・公表日 | 人口Importer対象 | 公開一次情報 |
 
@@ -136,11 +138,13 @@ terraform apply production-stage1.tfplan
 - Identity: User Assigned Managed Identity `${name_prefix}-github-deploy`
 - Issuer: `https://token.actions.githubusercontent.com`
 - Audience: `api://AzureADTokenExchange`
-- Subject: `repo:satoshiyanada888/kokusei:environment:production`
+- Subject: `repo:satoshiyanada888@16567805/kokusei@1301151718:environment:production`
 - GitHub permissions: Stage 2の`prepare` jobとStage 3の`publish` jobだけ`id-token: write`、全jobは`contents: read`
 - Environmentとbranch: OIDC subjectはEnvironmentを限定し、GitHub job guardとdeployment branch ruleでmainを重ねて制限する
 
-Repositoryは2026-07-15 03:15 UTC作成で、2026-07-21確認時点のOIDC customization APIは`use_default=true`、`use_immutable_subject=false`である。そのため、現行Terraformはlegacy Environment subjectを使用する。将来のopt-inやrepository移管でsubject形式が変わった場合に備え、deploy workflowはAzure login前にGitHubから実際のOIDC tokenを取得し、tokenをログへ出さず`github_actions_federated_subject`、issuer、audience、repository、environment、main ref、commit SHA、`workflow_ref`を完全一致検証する。不一致時はAzure login前に停止し、Federated Credentialを広く緩和せず、実claimに合わせたTerraform変更を別planでレビューする。
+GitHubのOIDC APIが返すsubject prefixは、owner loginの後ろにowner ID、repository名の後ろにrepository IDを付ける。ID付きsubjectはRepository移管や名称再利用に対して安定した識別子となり、末尾の`:environment:production`でRequired Reviewerに保護されたProduction Environmentへ限定する。Azure Federated CredentialとGitHub Environment Variable `AZURE_FEDERATED_SUBJECT`には、Terraform output `github_actions_federated_subject`の同じ完全値を設定し、wildcardやbranch-only subjectへ緩和しない。
+
+subjectを変更するときは、Federated Credential以外に差分がないTerraform planを別途レビューし、GitHub OIDC claim検証で実tokenとの完全一致を確認する。deploy workflowはAzure login前にtoken本体をログへ出さず、subject、issuer、audience、repository、environment、main ref、commit SHA、`workflow_ref`を検証する。不一致時はAzure login前に停止し、trust範囲を広げず実claimに合わせてTerraformとEnvironment Variableを同時に更新する。
 
 Azure role assignment:
 

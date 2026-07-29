@@ -277,8 +277,12 @@ if NEON_DATABASE_URL="$disabled_backend" NEON_URL_VALIDATION_MODE=backend "$url_
 fi
 
 repository=satoshiyanada888/kokusei
+repository_owner=satoshiyanada888
+repository_name=kokusei
+repository_owner_id=16567805
+repository_id=1301151718
 commit=0123456789abcdef0123456789abcdef01234567
-subject="repo:$repository:environment:production"
+subject="repo:$repository_owner@$repository_owner_id/$repository_name@$repository_id:environment:production"
 
 verify_oidc_workflow() {
   workflow_path=$1
@@ -292,10 +296,20 @@ verify_oidc_workflow() {
 verify_oidc_workflow .github/workflows/prepare-production.yml
 verify_oidc_workflow .github/workflows/deploy-production.yml
 
-if OIDC_TOKEN="$oidc_token" EXPECTED_OIDC_SUBJECT="repo:wrong/repository:environment:production" EXPECTED_WORKFLOW_PATH=.github/workflows/deploy-production.yml GITHUB_REPOSITORY="$repository" GITHUB_SHA="$commit" "$oidc_validator" >/dev/null 2>&1; then
-  echo "OIDC claim validator accepted a mismatched federated subject" >&2
-  exit 1
-fi
+reject_oidc_subject() {
+  rejected_subject=$1
+  description=$2
+  if OIDC_TOKEN="$oidc_token" EXPECTED_OIDC_SUBJECT="$rejected_subject" EXPECTED_WORKFLOW_PATH=.github/workflows/deploy-production.yml GITHUB_REPOSITORY="$repository" GITHUB_SHA="$commit" "$oidc_validator" >/dev/null 2>&1; then
+    echo "OIDC claim validator accepted $description" >&2
+    exit 1
+  fi
+}
+
+reject_oidc_subject "repo:$repository:environment:production" "the legacy production subject"
+reject_oidc_subject "repo:$repository_owner/$repository_name@$repository_id:environment:production" "a subject without the owner ID"
+reject_oidc_subject "repo:$repository_owner@$repository_owner_id/$repository_name:environment:production" "a subject without the repository ID"
+reject_oidc_subject "repo:$repository_owner@$repository_owner_id/$repository_name@$repository_id:environment:*" "a wildcard environment subject"
+reject_oidc_subject "repo:$repository_owner@$repository_owner_id/$repository_name@$repository_id:environment:staging" "a non-production environment subject"
 
 if OIDC_TOKEN="$oidc_token" EXPECTED_OIDC_SUBJECT="$subject" EXPECTED_WORKFLOW_PATH=.github/workflows/unapproved.yml GITHUB_REPOSITORY="$repository" GITHUB_SHA="$commit" "$oidc_validator" >/dev/null 2>&1; then
   echo "OIDC claim validator accepted an unapproved workflow path" >&2
