@@ -227,8 +227,25 @@ if grep -F -- '--input-type=module' "$stage3_workflow" >/dev/null; then
   echo "Stage 3 Smoke Job must not pass --input-type=module through Azure CLI" >&2
   exit 1
 fi
-if [ "$(grep -F -c -- '--args=-e "$validation_code"' "$stage3_workflow")" -ne 2 ]; then
-  echo "Stage 3 Smoke Job create and update must pass Node code with --args=-e" >&2
+if grep -F -- '--args=-e "$validation_code"' "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 Smoke Job must not leave validation_code as a separate Azure CLI argument" >&2
+  exit 1
+fi
+if [ "$(grep -F -c -- '--args="--eval=$validation_code"' "$stage3_workflow")" -ne 2 ]; then
+  echo "Stage 3 Smoke Job create and update must pass Node code as one --eval argument" >&2
+  exit 1
+fi
+validation_code=$(cat <<'JAVASCRIPT'
+const sample = {
+  text: "spaces, \"double quotes\", and 'single quotes'",
+  url: "https://example.invalid/path?q=(value);",
+  json: '{"ok":true}'
+};
+JAVASCRIPT
+)
+set -- "--eval=$validation_code"
+if [ "$#" -ne 1 ] || [ "$1" != "--eval=$validation_code" ]; then
+  echo "Stage 3 Smoke Job validation_code must remain one shell argv element" >&2
   exit 1
 fi
 require "az containerapp revision show" "$stage3_workflow"

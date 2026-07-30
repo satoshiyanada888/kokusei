@@ -393,13 +393,13 @@ jobs:
               --environment "$AZURE_CONTAINER_APP_ENVIRONMENT" --trigger-type Manual \
               --replica-completion-count 1 --parallelism 1 --replica-retry-limit 0 --replica-timeout 600 \
               --image "$FRONTEND_IMAGE" --command node \
-              --args=-e "$validation_code" \
+              --args="--eval=$validation_code" \
               --mi-user-assigned "$BACKEND_IDENTITY_ID" --registry-server "$REGISTRY" --registry-identity "$BACKEND_IDENTITY_ID" \
               --env-vars TARGET_URL="$BACKEND_URL" --cpu 0.25 --memory 0.5Gi --only-show-errors --output none
           else
             az containerapp job update -g "$AZURE_RESOURCE_GROUP" -n "$job" \
               --image "$FRONTEND_IMAGE" --command node \
-              --args=-e "$validation_code" \
+              --args="--eval=$validation_code" \
               --replace-env-vars TARGET_URL="$BACKEND_URL" --output none
           fi
           execution="$(az containerapp job start -g "$AZURE_RESOURCE_GROUP" -n "$job" --query name -o tsv)"
