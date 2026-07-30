@@ -119,18 +119,26 @@ Migration imageの`schema_migrations`により再実行は安全で、各migrati
 
 ## Stage 3: Container Apps公開
 
-`.github/workflows/deploy-production.yml`はStage 3専用の別の`workflow_dispatch`である。Stage 2のjob summaryまたはartifactを人が確認し、完全なcommit SHA、Frontend digest、Backend digestを手動入力してRequired Reviewerが承認した場合だけ実行する。Stage 3はDocker buildとACR pushを行わない。
+`.github/workflows/deploy-production.yml`はStage 3専用の別の`workflow_dispatch`である。Stage 2のjob summaryまたはartifactを人が確認し、Stage 2 Run ID、完全なcommit SHA、Frontend digest、Backend digestを手動入力してRequired Reviewerが承認した場合だけ実行する。Stage 3はDocker buildとACR pushを行わない。
 
+- Environment承認前のvalidate jobは、指定Run IDが同じrepositoryの`Prepare production (Stage 2)`、`workflow_dispatch`、`main`、`completed/success`、attempt 1、入力commit SHAであることをGitHub APIで確認する。入力commit SHAはStage 3の`github.sha`とも完全一致し、過去のmain commitは公開しない。
+- 指定Run IDに所属する有効な`production-stage2-<commit SHA>`が1件だけ存在することを確認し、そのartifact IDを直接取得する。metadataのcommit SHA、両digest、`linux/amd64`、Migration、3 Import、全Validationを入力値と完全一致検証する。他runや同名複数artifactを最新順で選ばない。
+- Stage 3 Workflow自体を変更したcommitでは、その新commitを対象にStage 2を改めて1回実行して新しいartifactとdigestを作る。古いStage 2 artifactを新しいWorkflow SHAへ流用しない。
 - Stage 3は入力digestがACRに存在し、入力commit SHA tagと対応し、`linux/amd64`であることを再確認する。Container AppsとSmoke Jobはtagではなく`repository@sha256:...`を使用する。
 - Backend: internal ingress、port 8080、0.25 vCPU/0.5 GiB、min 0/max 2、non-root、専用Managed IdentityによるACR pull。`/health`をStartup/Liveness/Readiness probeに使う。現在の`/health`はprocess-onlyで、起動後のDB接続状態は確認しない。
 - `NEON_DATABASE_URL`をAzure Container Apps Secret `neon-database-url`へCLIで登録し、`DATABASE_URL=secretref:neon-database-url`。Terraformへ渡さない。
 - pgx poolは1 replicaあたり最大5接続（最大2 replicaで合計最大10接続）。既定のconnect timeoutとstatement timeoutは各10秒で、URLに明示値があればそれを優先する。起動時DB pingはNeon/Container Apps双方のcold startを考慮して最大約40秒retryする。
-- Backend healthと3詳細APIを同一Container Apps Environment内の一回限りSmoke Jobで確認する。
+- Backend health、指標一覧、人口・出生数・完全失業率の詳細APIを同一Container Apps Environment内の手動Trigger Smoke Jobで確認する。配列が空でないこと、3 slugが存在すること、一覧と詳細の最新値がnullまたは空文字でないことも検証する。
 - 成功後にFrontendをexternal ingress、port 3000、0.25 vCPU/0.5 GiB、min 0/max 2で作成/更新し、server-side `INTERNAL_API_URL`でBackend internal FQDNへ接続する。Frontendの軽量な`/health`をStartup/Liveness/Readiness probeに使用する。ブラウザからBackendへ直接接続しない。
+- BackendとFrontendは対象RevisionへTrafficを明示的に100%割り当てる。AzureからAppとRevisionをread-backし、名前、Ingress、port、digest URI、ACR server、Managed Identity、Secret reference、active Revision、Traffic合計100%と旧Revision 0%を検証する。Frontendはexternal、Backendはinternalでなければ失敗する。
 
 WorkflowはSecret値を含むBackend仕様を権限`0600`の一時ディレクトリへ生成し、`az containerapp create/update --yaml`へ渡す。shellの`trap`で成功・失敗・signalを問わずディレクトリを削除し、Git、artifact、Terraform、Docker imageへ保存しない。Workflowログとjob summaryにも接続URLを出力しない。
 
-Smoke JobはMigration imageではなくBackend imageの`/smoke-test`を使用する。これはACRに既に存在するBackend SHA imageの再利用であり、Migration Container Apps Jobではない。
+Smoke JobはMigration imageを使用しない。ACRに存在するFrontend digest imageのNode.js runtimeを使い、internal Backend APIのJSONを検証する。JobのManaged Identityは対象ACRだけの`AcrPull`を持ち、Neon Secretを受け取らない。
+
+Stage 3の必須Environment Variablesとして、Stage 1後に`AZURE_RESOURCE_GROUP`、`AZURE_CONTAINER_APP_ENVIRONMENT`、`AZURE_CONTAINER_APP_FRONTEND`、`AZURE_CONTAINER_APP_BACKEND`、`FRONTEND_IDENTITY_ID`、`BACKEND_IDENTITY_ID`をTerraform outputとAzure実値から登録する。Identity IDは文字列を組み立てず、`frontend_identity_id`と`backend_identity_id` outputまたは`az identity show --query id`を使う。
+
+初回公開には旧正常Revisionがない。途中失敗時はContainer Apps、Revision、Ingress、Trafficを自動削除・自動rollbackせず、再実行もしない。`always()`の最終stepが残存App、公開状態、FQDN、latest Revision、Trafficをjob summaryへ記録し、人間が修正・削除・新しいレビュー後の再実行を判断する。Frontend external化後の失敗ではAzure HTTPS URLが到達可能な場合がある。
 
 ## Frontend画像最適化の暫定ガード
 

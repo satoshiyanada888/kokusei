@@ -10,13 +10,15 @@ url_validator=scripts/production/validate-neon-urls.py
 oidc_validator=scripts/production/verify-github-oidc-claims.py
 platform_verifier=scripts/production/verify-image-platform.sh
 acr_login_server_validator=scripts/production/validate-acr-login-server.sh
+stage2_evidence_validator=scripts/production/validate-stage2-evidence.py
+container_app_state_validator=scripts/production/verify-container-app-state.py
 frontend_config=frontend/next.config.ts
 frontend_middleware=frontend/middleware.ts
 
 require() {
   pattern=$1
   file=$2
-  grep -F "$pattern" "$file" >/dev/null || {
+  grep -F -- "$pattern" "$file" >/dev/null || {
     echo "Missing production guard in $file: $pattern" >&2
     exit 1
   }
@@ -166,12 +168,43 @@ fi
 require "commit_sha:" "$stage3_workflow"
 require "frontend_image_digest:" "$stage3_workflow"
 require "backend_image_digest:" "$stage3_workflow"
+require "actions: read" "$stage3_workflow"
+stage2_run_input=$(
+  awk '
+    /^      stage2_run_id:$/ { capture = 1; next }
+    capture && /^      [A-Za-z0-9_]+:$/ { exit }
+    capture && !/^        / { exit }
+    capture { print }
+  ' "$stage3_workflow"
+)
+printf '%s\n' "$stage2_run_input" | grep -F "required: true" >/dev/null || {
+  echo "Stage 3 stage2_run_id input must be required" >&2
+  exit 1
+}
+printf '%s\n' "$stage2_run_input" | grep -F "type: string" >/dev/null || {
+  echo "Stage 3 stage2_run_id input must be a string" >&2
+  exit 1
+}
+if printf '%s\n' "$stage2_run_input" | grep -F "default:" >/dev/null; then
+  echo "Stage 3 stage2_run_id input must not define a default" >&2
+  exit 1
+fi
+
+require '[[ "$STAGE2_RUN_ID" =~ ^[1-9][0-9]*$ ]]' "$stage3_workflow"
+require 'ACTUAL_COMMIT_SHA: ${{ github.sha }}' "$stage3_workflow"
+require '[ "$TARGET_COMMIT" = "$ACTUAL_COMMIT_SHA" ]' "$stage3_workflow"
+require "Bind Stage 3 inputs to the exact successful Stage 2 artifact" "$stage3_workflow"
+require 'repos/$GITHUB_REPOSITORY/actions/runs/$STAGE2_RUN_ID' "$stage3_workflow"
+require 'repos/$GITHUB_REPOSITORY/actions/runs/$STAGE2_RUN_ID/artifacts?per_page=100' "$stage3_workflow"
+require 'repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip' "$stage3_workflow"
+require "select-artifact" "$stage3_workflow"
+require "validate-metadata" "$stage3_workflow"
+require "production-stage2-metadata.json" "$stage3_workflow"
 require "PUBLISH" "$stage3_workflow"
 require 'ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}' "$stage3_workflow"
 require "AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER" "$stage3_workflow"
 require 'az acr login --name "$AZURE_CONTAINER_REGISTRY"' "$stage3_workflow"
 require 'registry="$(scripts/production/validate-acr-login-server.sh)"' "$stage3_workflow"
-require "git merge-base --is-ancestor" "$stage3_workflow"
 require 'FRONTEND_IMAGE=$registry/frontend@$FRONTEND_DIGEST' "$stage3_workflow"
 require 'BACKEND_IMAGE=$registry/backend@$BACKEND_DIGEST' "$stage3_workflow"
 require "digest is not tagged with the requested commit SHA" "$stage3_workflow"
@@ -188,7 +221,38 @@ require "chmod 0600" "$stage3_workflow"
 require "Verify Frontend health" "$stage3_workflow"
 require "Run public smoke tests" "$stage3_workflow"
 require "Write Stage 3 deployment summary" "$stage3_workflow"
+require "Indicator API payload is empty" "$stage3_workflow"
+require '"population", "births", "unemployment-rate"' "$stage3_workflow"
+require "az containerapp revision show" "$stage3_workflow"
+require 'EXPECTED_IMAGE="$BACKEND_IMAGE"' "$stage3_workflow"
+require 'EXPECTED_IMAGE="$FRONTEND_IMAGE"' "$stage3_workflow"
+require "CONTAINER_APP_KIND=backend" "$stage3_workflow"
+require "CONTAINER_APP_KIND=frontend" "$stage3_workflow"
+require 'external: false' "$stage3_workflow"
+require 'external: true' "$stage3_workflow"
+require 'az containerapp ingress traffic set' "$stage3_workflow"
+require '--revision-weight "$backend_revision=100"' "$stage3_workflow"
+require '--revision-weight "$frontend_revision=100"' "$stage3_workflow"
+require "Report remaining production state without mutation" "$stage3_workflow"
+require "Automatic deletion: disabled" "$stage3_workflow"
+require "Automatic rollback: disabled" "$stage3_workflow"
+require "If Frontend external ingress is true" "$stage3_workflow"
 require "EXPECTED_WORKFLOW_PATH: .github/workflows/deploy-production.yml" "$stage3_workflow"
+require '"traffic total"' "$container_app_state_validator"
+require '"target revision traffic"' "$container_app_state_validator"
+require '"no old revision traffic"' "$container_app_state_validator"
+
+evidence_line=$(grep -n -m1 'Bind Stage 3 inputs to the exact successful Stage 2 artifact' "$stage3_workflow" | cut -d: -f1)
+publish_line=$(grep -n -m1 '^  publish:$' "$stage3_workflow" | cut -d: -f1)
+azure_login_line=$(grep -n -m1 'Authenticate to Azure with verified OIDC' "$stage3_workflow" | cut -d: -f1)
+[ "$evidence_line" -lt "$publish_line" ] || {
+  echo "Stage 2 evidence validation must finish before the protected Stage 3 job" >&2
+  exit 1
+}
+[ "$evidence_line" -lt "$azure_login_line" ] || {
+  echo "Stage 2 evidence validation must finish before Azure login" >&2
+  exit 1
+}
 
 for workflow in "$stage2_workflow" "$stage3_workflow"; do
   login_server_validation_line=$(grep -n -m1 'validate-acr-login-server.sh >/dev/null' "$workflow" | cut -d: -f1)
@@ -206,6 +270,11 @@ done
 
 if grep -E '(^|[[:space:]])docker (build|push)([[:space:]]|$)|docker buildx build' "$stage3_workflow" >/dev/null; then
   echo "Stage 3 must not build or push Docker images" >&2
+  exit 1
+fi
+
+if grep -E 'az containerapp (delete|revision deactivate)|gh run (rerun|run)' "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 must not automatically delete, roll back, rerun, or dispatch" >&2
   exit 1
 fi
 
@@ -230,6 +299,9 @@ if grep -F 'set -x' "$stage2_workflow" "$stage3_workflow" "$stage2" "$url_valida
   echo "Production workflows and scripts must not enable shell tracing" >&2
   exit 1
 fi
+
+python3 "$stage2_evidence_validator" self-test >/dev/null
+python3 "$container_app_state_validator" --self-test >/dev/null
 
 require "docker buildx imagetools inspect" "$platform_verifier"
 require "only linux/amd64 runtime platforms" "$platform_verifier"
@@ -307,12 +379,22 @@ metadata_line=$(grep -n -m1 'Write safe Stage 2 metadata' "$stage2_workflow" | c
 [ "$database_line" -lt "$metadata_line" ] || { echo "Successful database validation must precede Stage 2 metadata" >&2; exit 1; }
 
 backend_line=$(grep -n -m1 'Create or update internal Backend' "$stage3_workflow" | cut -d: -f1)
+backend_traffic_line=$(grep -n -m1 -- '--revision-weight "$backend_revision=100"' "$stage3_workflow" | cut -d: -f1)
+backend_readback_line=$(grep -n -m1 'CONTAINER_APP_KIND=backend' "$stage3_workflow" | cut -d: -f1)
 backend_verify_line=$(grep -n -m1 'Verify internal Backend health' "$stage3_workflow" | cut -d: -f1)
 frontend_line=$(grep -n -m1 'Create or update Frontend after Backend validation' "$stage3_workflow" | cut -d: -f1)
+frontend_traffic_line=$(grep -n -m1 -- '--revision-weight "$frontend_revision=100"' "$stage3_workflow" | cut -d: -f1)
+frontend_readback_line=$(grep -n -m1 'CONTAINER_APP_KIND=frontend' "$stage3_workflow" | cut -d: -f1)
 frontend_health_line=$(grep -n -m1 'Verify Frontend health' "$stage3_workflow" | cut -d: -f1)
 smoke_line=$(grep -n -m1 'Run public smoke tests' "$stage3_workflow" | cut -d: -f1)
+[ "$backend_line" -lt "$backend_traffic_line" ] || { echo "Backend deployment must precede Traffic assignment" >&2; exit 1; }
+[ "$backend_traffic_line" -lt "$backend_readback_line" ] || { echo "Backend Traffic assignment must precede read-back" >&2; exit 1; }
+[ "$backend_readback_line" -lt "$backend_verify_line" ] || { echo "Backend read-back must precede internal health validation" >&2; exit 1; }
 [ "$backend_line" -lt "$backend_verify_line" ] || { echo "Backend deployment must precede internal health validation" >&2; exit 1; }
 [ "$backend_verify_line" -lt "$frontend_line" ] || { echo "Backend validation must precede Frontend deployment" >&2; exit 1; }
+[ "$frontend_line" -lt "$frontend_traffic_line" ] || { echo "Frontend deployment must precede Traffic assignment" >&2; exit 1; }
+[ "$frontend_traffic_line" -lt "$frontend_readback_line" ] || { echo "Frontend Traffic assignment must precede read-back" >&2; exit 1; }
+[ "$frontend_readback_line" -lt "$frontend_health_line" ] || { echo "Frontend read-back must precede Frontend health validation" >&2; exit 1; }
 [ "$frontend_line" -lt "$frontend_health_line" ] || { echo "Frontend deployment must precede Frontend health validation" >&2; exit 1; }
 [ "$frontend_health_line" -lt "$smoke_line" ] || { echo "Frontend health must precede public smoke tests" >&2; exit 1; }
 

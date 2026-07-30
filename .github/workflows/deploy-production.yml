@@ -3,6 +3,10 @@ name: Publish production (Stage 3)
 on:
   workflow_dispatch:
     inputs:
+      stage2_run_id:
+        description: "Successful Production Stage 2 run ID that produced the reviewed artifact"
+        required: true
+        type: string
       commit_sha:
         description: "Full commit SHA completed by Production Stage 2"
         required: true
@@ -21,6 +25,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -33,36 +38,85 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
+      STAGE2_RUN_ID: ${{ inputs.stage2_run_id }}
       TARGET_COMMIT: ${{ inputs.commit_sha }}
       FRONTEND_DIGEST: ${{ inputs.frontend_image_digest }}
       BACKEND_DIGEST: ${{ inputs.backend_image_digest }}
       PUBLISH_CONFIRMATION: ${{ inputs.confirmation }}
+      ACTUAL_COMMIT_SHA: ${{ github.sha }}
     steps:
       - name: Require explicit immutable Stage 3 inputs
         shell: bash
         run: |
           set -euo pipefail
           [ "$PUBLISH_CONFIRMATION" = "PUBLISH" ] || { echo "Production Stage 3 was not confirmed"; exit 1; }
+          [[ "$STAGE2_RUN_ID" =~ ^[1-9][0-9]*$ ]] || { echo "stage2_run_id must be a positive integer"; exit 1; }
           [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "commit_sha must be a full Git commit SHA"; exit 1; }
           [[ "$FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "frontend_image_digest must be a sha256 digest"; exit 1; }
           [[ "$BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "backend_image_digest must be a sha256 digest"; exit 1; }
+          [ "$TARGET_COMMIT" = "$ACTUAL_COMMIT_SHA" ] || {
+            echo "commit_sha must exactly match the dispatched Stage 3 workflow SHA"
+            exit 1
+          }
 
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Require the target commit to exist on main
+      - name: Require the target commit to be the reviewed main HEAD
         shell: bash
         run: |
           set -euo pipefail
           git cat-file -e "${TARGET_COMMIT}^{commit}"
-          git merge-base --is-ancestor "$TARGET_COMMIT" origin/main || {
-            echo "The requested commit does not exist on the production main branch"
+          [ "$(git rev-parse HEAD)" = "$TARGET_COMMIT" ] || {
+            echo "The checked out Stage 3 workflow SHA does not match commit_sha"
             exit 1
           }
 
       - name: Verify production workflow guards
         run: scripts/production/check-workflow-guards.sh
+
+      - name: Bind Stage 3 inputs to the exact successful Stage 2 artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          temporary_directory="$(mktemp -d "$RUNNER_TEMP/kokusei-stage2-evidence.XXXXXX")"
+          cleanup() {
+            rm -rf "$temporary_directory"
+          }
+          trap cleanup EXIT HUP INT TERM
+          chmod 0700 "$temporary_directory"
+
+          run_json="$temporary_directory/run.json"
+          artifacts_json="$temporary_directory/artifacts.json"
+          artifact_zip="$temporary_directory/artifact.zip"
+          metadata_json="$temporary_directory/production-stage2-metadata.json"
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGE2_RUN_ID" > "$run_json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGE2_RUN_ID/artifacts?per_page=100" > "$artifacts_json"
+          chmod 0600 "$run_json" "$artifacts_json"
+
+          artifact_id="$(
+            scripts/production/validate-stage2-evidence.py \
+              select-artifact "$run_json" "$artifacts_json"
+          )"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "Validated Stage 2 artifact ID is invalid"
+            exit 1
+          }
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$artifact_zip"
+          chmod 0600 "$artifact_zip"
+          [ "$(zipinfo -1 "$artifact_zip")" = "production-stage2-metadata.json" ] || {
+            echo "Stage 2 artifact must contain only production-stage2-metadata.json"
+            exit 1
+          }
+          unzip -qq "$artifact_zip" -d "$temporary_directory"
+          chmod 0600 "$metadata_json"
+          scripts/production/validate-stage2-evidence.py \
+            validate-metadata "$metadata_json"
 
   publish:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
@@ -76,6 +130,7 @@ jobs:
       name: production
       url: ${{ vars.NEXT_PUBLIC_SITE_URL }}
     env:
+      STAGE2_RUN_ID: ${{ inputs.stage2_run_id }}
       TARGET_COMMIT: ${{ inputs.commit_sha }}
       FRONTEND_DIGEST: ${{ inputs.frontend_image_digest }}
       BACKEND_DIGEST: ${{ inputs.backend_image_digest }}
@@ -131,6 +186,10 @@ jobs:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
           subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Mark the verified Azure session
+        shell: bash
+        run: echo "AZURE_AUTHENTICATED=true" >> "$GITHUB_ENV"
 
       - name: Verify Stage 2 digests and linux/amd64 manifests
         shell: bash
@@ -250,6 +309,34 @@ jobs:
 
           backend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --query properties.configuration.ingress.fqdn -o tsv)"
           backend_revision="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --query properties.latestRevisionName -o tsv)"
+          [ -n "$backend_revision" ] || { echo "Backend active revision is missing"; exit 1; }
+          az containerapp ingress traffic set \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$AZURE_CONTAINER_APP_BACKEND" \
+            --revision-weight "$backend_revision=100" \
+            --only-show-errors --output none
+
+          backend_app_json="$temporary_directory/backend-app.json"
+          backend_revision_json="$temporary_directory/backend-revision.json"
+          az containerapp show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$AZURE_CONTAINER_APP_BACKEND" \
+            --output json > "$backend_app_json"
+          az containerapp revision show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$AZURE_CONTAINER_APP_BACKEND" \
+            --revision "$backend_revision" \
+            --output json > "$backend_revision_json"
+          chmod 0600 "$backend_app_json" "$backend_revision_json"
+          CONTAINER_APP_KIND=backend \
+            EXPECTED_APP_NAME="$AZURE_CONTAINER_APP_BACKEND" \
+            EXPECTED_REVISION="$backend_revision" \
+            EXPECTED_IMAGE="$BACKEND_IMAGE" \
+            EXPECTED_REGISTRY="$REGISTRY" \
+            EXPECTED_IDENTITY_ID="$BACKEND_IDENTITY_ID" \
+            scripts/production/verify-container-app-state.py \
+              "$backend_app_json" "$backend_revision_json"
+
           {
             echo "BACKEND_URL=https://$backend_fqdn"
             echo "BACKEND_FQDN=$backend_fqdn"
@@ -261,16 +348,58 @@ jobs:
         run: |
           set -euo pipefail
           job="kokusei-prod-smoke"
+          validation_code="$(cat <<'JAVASCRIPT'
+          const base = process.env.TARGET_URL;
+          const required = ["population", "births", "unemployment-rate"];
+          const request = async (path) => {
+            let lastError;
+            for (let attempt = 0; attempt < 12; attempt += 1) {
+              try {
+                const response = await fetch(`${base}${path}`);
+                if (!response.ok) throw new Error(`status ${response.status}`);
+                return response;
+              } catch (error) {
+                lastError = error;
+                await new Promise((resolve) => setTimeout(resolve, 5000));
+              }
+            }
+            throw lastError;
+          };
+          (async () => {
+            await request("/health");
+            const payload = await (await request("/api/indicators")).json();
+            if (!Array.isArray(payload.data) || payload.data.length === 0) {
+              throw new Error("Indicator API payload is empty");
+            }
+            for (const slug of required) {
+              const indicator = payload.data.find((item) => item.slug === slug);
+              if (!indicator || indicator.latest?.value == null || indicator.latest.value === "") {
+                throw new Error(`Required indicator value is missing: ${slug}`);
+              }
+              const detail = await (await request(`/api/indicators/${slug}`)).json();
+              if (detail.data?.latest?.value == null || detail.data.latest.value === "") {
+                throw new Error(`Required indicator detail value is missing: ${slug}`);
+              }
+            }
+            console.log("Backend health, indicator list, and official indicator values are valid");
+          })().catch((error) => {
+            console.error(error.message);
+            process.exit(1);
+          });
+          JAVASCRIPT
+          )"
           if ! az containerapp job show -g "$AZURE_RESOURCE_GROUP" -n "$job" --output none 2>/dev/null; then
             az containerapp job create -g "$AZURE_RESOURCE_GROUP" -n "$job" \
               --environment "$AZURE_CONTAINER_APP_ENVIRONMENT" --trigger-type Manual \
               --replica-completion-count 1 --parallelism 1 --replica-retry-limit 0 --replica-timeout 600 \
-              --image "$BACKEND_IMAGE" --command /smoke-test \
+              --image "$FRONTEND_IMAGE" --command node \
+              --args "--input-type=module" "-e" "$validation_code" \
               --mi-user-assigned "$BACKEND_IDENTITY_ID" --registry-server "$REGISTRY" --registry-identity "$BACKEND_IDENTITY_ID" \
               --env-vars TARGET_URL="$BACKEND_URL" --cpu 0.25 --memory 0.5Gi --only-show-errors --output none
           else
             az containerapp job update -g "$AZURE_RESOURCE_GROUP" -n "$job" \
-              --image "$BACKEND_IMAGE" --command /smoke-test \
+              --image "$FRONTEND_IMAGE" --command node \
+              --args "--input-type=module" "-e" "$validation_code" \
               --replace-env-vars TARGET_URL="$BACKEND_URL" --output none
           fi
           execution="$(az containerapp job start -g "$AZURE_RESOURCE_GROUP" -n "$job" --query name -o tsv)"
@@ -343,6 +472,34 @@ jobs:
           frontend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.configuration.ingress.fqdn -o tsv)"
           [ "https://$frontend_fqdn" = "${NEXT_PUBLIC_SITE_URL%/}" ] || { echo "Frontend FQDN does not match NEXT_PUBLIC_SITE_URL"; exit 1; }
           frontend_revision="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.latestRevisionName -o tsv)"
+          [ -n "$frontend_revision" ] || { echo "Frontend active revision is missing"; exit 1; }
+          az containerapp ingress traffic set \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$AZURE_CONTAINER_APP_FRONTEND" \
+            --revision-weight "$frontend_revision=100" \
+            --only-show-errors --output none
+
+          frontend_app_json="$temporary_directory/frontend-app.json"
+          frontend_revision_json="$temporary_directory/frontend-revision.json"
+          az containerapp show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$AZURE_CONTAINER_APP_FRONTEND" \
+            --output json > "$frontend_app_json"
+          az containerapp revision show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$AZURE_CONTAINER_APP_FRONTEND" \
+            --revision "$frontend_revision" \
+            --output json > "$frontend_revision_json"
+          chmod 0600 "$frontend_app_json" "$frontend_revision_json"
+          CONTAINER_APP_KIND=frontend \
+            EXPECTED_APP_NAME="$AZURE_CONTAINER_APP_FRONTEND" \
+            EXPECTED_REVISION="$frontend_revision" \
+            EXPECTED_IMAGE="$FRONTEND_IMAGE" \
+            EXPECTED_REGISTRY="$REGISTRY" \
+            EXPECTED_IDENTITY_ID="$FRONTEND_IDENTITY_ID" \
+            scripts/production/verify-container-app-state.py \
+              "$frontend_app_json" "$frontend_revision_json"
+
           {
             echo "FRONTEND_URL=https://$frontend_fqdn"
             echo "FRONTEND_REVISION=$frontend_revision"
@@ -365,6 +522,13 @@ jobs:
             curl --fail --silent --show-error --location --retry 12 --retry-all-errors --retry-delay 5 --output /dev/null "$site$path"
           done
           html="$(curl --fail --silent --show-error --location "$site/")"
+          for slug in population births unemployment-rate; do
+            printf '%s' "$html" | grep -F "/indicators/$slug" >/dev/null
+          done
+          if printf '%s' "$html" | grep -F "現在、表示できる指標が登録されていません。" >/dev/null; then
+            echo "Public dashboard reported an empty indicator list"
+            exit 1
+          fi
           printf '%s' "$html" | grep -F "<link rel=\"canonical\" href=\"$site/\""
           printf '%s' "$html" | grep -F "property=\"og:url\" content=\"$site/\""
           printf '%s' "$html" | grep -F "property=\"og:image\" content=\"$site/og-image.png\""
@@ -379,14 +543,76 @@ jobs:
           {
             echo "## Production Stage 3 completed"
             echo
+            echo "- Stage 2 run ID: \`$STAGE2_RUN_ID\`"
             echo "- Commit SHA: \`$TARGET_COMMIT\`"
             echo "- Frontend URL: $FRONTEND_URL"
             echo "- Frontend revision: \`$FRONTEND_REVISION\`"
             echo "- Frontend digest: \`$FRONTEND_DIGEST\`"
+            echo "- Frontend ingress/traffic read-back: external, target revision 100%"
             echo "- Backend internal FQDN: \`$BACKEND_FQDN\`"
             echo "- Backend revision: \`$BACKEND_REVISION\`"
             echo "- Backend digest: \`$BACKEND_DIGEST\`"
+            echo "- Backend ingress/traffic read-back: internal, target revision 100%"
             echo "- Backend health/API validation: succeeded"
             echo "- Frontend health: succeeded"
             echo "- Public smoke tests: succeeded"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Initial publication has no known-good revision. Never delete or roll back
+      # automatically; preserve and report the exact state for human review.
+      - name: Report remaining production state without mutation
+        if: ${{ always() }}
+        env:
+          PRIOR_JOB_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          set -u
+          {
+            echo
+            echo "## Stage 3 final state"
+            echo
+            echo "- Job status before this report: \`$PRIOR_JOB_STATUS\`"
+            echo "- Automatic workflow rerun: disabled"
+            echo "- Automatic deletion: disabled"
+            echo "- Automatic rollback: disabled"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${AZURE_AUTHENTICATED:-}" != "true" ]; then
+            {
+              echo "- Azure login was not completed; Container Apps mutation steps could not start."
+              echo "- Human action: correct the pre-deployment failure and perform a new review."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          report_app() {
+            app_name=$1
+            label=$2
+            if app_json="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$app_name" --output json 2>/dev/null)"; then
+              external="$(jq -r '.properties.configuration.ingress.external // false' <<<"$app_json")"
+              fqdn="$(jq -r '.properties.configuration.ingress.fqdn // "none"' <<<"$app_json")"
+              revision="$(jq -r '.properties.latestRevisionName // "none"' <<<"$app_json")"
+              traffic="$(jq -c '[.properties.configuration.ingress.traffic[]? | {revisionName,weight}]' <<<"$app_json")"
+              {
+                echo "- $label app: exists"
+                echo "- $label external ingress: \`$external\`"
+                echo "- $label FQDN: \`$fqdn\`"
+                echo "- $label latest revision: \`$revision\`"
+                echo "- $label traffic: \`$traffic\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- $label app: not created" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          report_app "$AZURE_CONTAINER_APP_BACKEND" "Backend"
+          report_app "$AZURE_CONTAINER_APP_FRONTEND" "Frontend"
+          if az containerapp job show -g "$AZURE_RESOURCE_GROUP" -n kokusei-prod-smoke --output none 2>/dev/null; then
+            echo "- Smoke job: exists" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Smoke job: not created" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo "- If Frontend external ingress is true, its Azure HTTPS URL may already be publicly reachable."
+            echo "- Human action: inspect the reported resources, ingress, revision, and traffic before deciding whether to fix, rerun, or remove them."
           } >> "$GITHUB_STEP_SUMMARY"

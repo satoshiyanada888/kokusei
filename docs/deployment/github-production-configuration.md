@@ -8,7 +8,7 @@
 |---|---|---|---|---|
 | 1: Azure基盤 | Resource Group、ACR、Log Analytics、Container Apps Environment、3 Managed Identities、限定RBAC、OIDC Federated Credential | operatorが対象Tenant・Subscription・Remote Stateとsaved planを確認 | planにdestroy/replace、想定外差分、権限・費用不明点がある | 同じsaved planだけをapplyする。失敗時はStateとAzure実体を再planし、推測で再applyしない |
 | 2: image・DB準備 | linux/amd64 SHA image build、Frontend/BackendをACRへpush、digest・manifest検証、Migration、3公式import、個別・横断validation | Stage 1成功、GitHub設定完了、Required Reviewer承認、対象SHA tagがACRに存在しない | いずれかのbuild、push、Migration、import、validationが失敗 | 既存SHA tagは上書きせず停止する。失敗原因とACR・Neon状態を確認し、必要なら修正commitで再実行する |
-| 3: 公開 | digest固定のinternal Backend、内部Smoke Job、digest固定のexternal Frontend、公開HTTPS/metadata確認 | Stage 2 artifact・summaryをレビューし、commit SHAと2つのdigestを別の手動実行へ入力してRequired Reviewerが承認 | digestとSHA tagの不一致、Backend health/API、FQDN照合、Frontend health/smoke testのいずれかが失敗 | Container Apps Multiple revisionsで直前の正常revisionへtrafficを戻す。DBは自動rollbackしない |
+| 3: 公開 | digest固定のinternal Backend、内部Smoke Job、digest固定のexternal Frontend、Revision/Ingress/Traffic read-back、公開HTTPS/metadata確認 | Stage 2 Run ID・artifact・summaryをレビューし、Run ID、commit SHA、2つのdigestを別の手動実行へ入力してRequired Reviewerが承認 | Stage 2証跡、digestとSHA tag、Backend health/API、read-back、FQDN、Frontend health/smoke testのいずれかが失敗 | 初回公開は自動削除・rollback・rerunせず残存状態を報告する。正常Revisionがある2回目以降だけ人間判断でtrafficを戻す |
 
 Stage 2は`.github/workflows/prepare-production.yml`、Stage 3は`.github/workflows/deploy-production.yml`であり、それぞれ独立した`workflow_dispatch`だけを持つ。Stage 2はStage 3を起動せず、Container Apps操作も行わない。両Workflowともmain以外をjob-level guardでskipし、protected jobは`production` Environment承認を通過するまでSecretとOIDC tokenへ到達しない。
 
@@ -48,6 +48,19 @@ Stage 2は`.github/workflows/prepare-production.yml`、Stage 3は`.github/workfl
 | `NEXT_PUBLIC_SITE_URL` | canonical/OGP/sitemap用HTTPS origin | `expected_frontend_url` output | Frontend初回build前 | guardで停止 |
 
 これらは識別子・公開originでありpasswordではないためVariableとする。ただし、値を推測せずStage 1 outputと対象Azure accountから転記する。
+
+Stage 3を初回実行する前に、少なくとも次の6件をStage 1 outputとAzure実値で照合してEnvironmentへ設定する。
+
+```text
+AZURE_RESOURCE_GROUP=rg-kokusei-prod
+AZURE_CONTAINER_APP_ENVIRONMENT=kokusei-prod-env
+AZURE_CONTAINER_APP_FRONTEND=kokusei-prod-frontend
+AZURE_CONTAINER_APP_BACKEND=kokusei-prod-backend
+FRONTEND_IDENTITY_ID=<terraform output -raw frontend_identity_id>
+BACKEND_IDENTITY_ID=<terraform output -raw backend_identity_id>
+```
+
+Identity IDは手入力で組み立てない。Terraform outputと`az identity show -g rg-kokusei-prod -n <identity-name> --query id -o tsv`が一致することを確認してから登録する。
 
 ### Terraform outputとRepository固定値
 
@@ -130,9 +143,22 @@ terraform apply production-stage1.tfplan
 7. GitHub上の`main` HEADを確認して、事前レビュー済みcommitの40文字完全SHAを取得する。短縮SHAは使用しない。
 8. `Actions > Prepare production (Stage 2) > Run workflow`でbranch `main`を選び、`expected_commit_sha`へ確認済み完全SHA、confirmationへ正確に`PREPARE`と入力する。dispatchされた`github.sha`と一致しなければvalidate jobがEnvironment承認前に停止する。
 9. validate job成功後、Required Reviewerは対象commit SHAを再確認して`prepare` jobを承認する。事前レビューしたSHA以外は承認しない。
-10. Stage 2成功後、artifactまたはjob summaryのcommit SHA、Frontend digest、Backend digest、platform、Migration・Import・Validation結果を確認する。
-11. `Actions > Publish production (Stage 3) > Run workflow`でbranch `main`を選び、確認済みのcommit SHAと2つのdigestを入力し、confirmationへ正確に`PUBLISH`と入力する。
-12. Stage 3のRequired Reviewerは入力値がStage 2結果と一致することを再確認して`publish` jobを承認する。
+10. Stage 2成功後、Run IDと、そのrunに所属するartifactまたはjob summaryのcommit SHA、Frontend digest、Backend digest、platform、Migration・Import・Validation結果を一体として確認する。
+11. `Actions > Publish production (Stage 3) > Run workflow`でbranch `main`を選び、確認済みのStage 2 Run ID、commit SHA、2つのdigestを入力し、confirmationへ正確に`PUBLISH`と入力する。
+12. Stage 3のvalidate jobは、指定Runがattempt 1の`completed/success`であること、artifactがそのrunに一意に所属すること、metadataと全入力が完全一致すること、入力commitがStage 3の`github.sha`と一致することをEnvironment承認前に検証する。
+13. Stage 3のRequired Reviewerはvalidate成功後、Run ID、commit、artifact、digestの組を再確認して`publish` jobを承認する。
+
+証跡の組を確認する形式例:
+
+```text
+stage2_run_id=30509831983
+commit_sha=66036f51233c62bb3b5c1a82966d89c4bd0f1494
+frontend_image_digest=sha256:965dc2e952b81936aab406a1a488c72696ce6b1567c10c817b34979c8afb3db6
+backend_image_digest=sha256:ee7fff9e1614bb298af7706d477e087cb72dcecd77f0bbd793de5448f6412aad
+confirmation=PUBLISH
+```
+
+この例はStage 2 Run `30509831983`の証跡であり、Workflow guard修正commitをpushした後のStage 3には使用できない。Stage 3は`commit_sha == github.sha`を要求するため、新commitをレビューしてStage 2を1回実行し、その新しいRun ID、commit SHA、2つのdigestへすべて置き換える。古いartifactと新しいWorkflow SHAを混在させない。
 
 実行を中止する場合はEnvironment承認を拒否するか、待機中のrunをcancelする。Stage 2完了後もStage 3は自動起動しない。protected job開始後のcancelはACR tag、Neon処理、Container App revisionなどの途中状態を残し得るため、実体を確認してから次の対応を判断する。両Workflowのconcurrencyは`production-deployment`、`cancel-in-progress: false`なので相互に並行実行せず、進行中runを中断しない。
 
@@ -142,7 +168,7 @@ terraform apply production-stage1.tfplan
 - Issuer: `https://token.actions.githubusercontent.com`
 - Audience: `api://AzureADTokenExchange`
 - Subject: `repo:satoshiyanada888@16567805/kokusei@1301151718:environment:production`
-- GitHub permissions: Stage 2の`prepare` jobとStage 3の`publish` jobだけ`id-token: write`、全jobは`contents: read`
+- GitHub permissions: Stage 2の`prepare` jobとStage 3の`publish` jobだけ`id-token: write`、全jobは`contents: read`。Stage 3のvalidate jobだけ指定Runとartifact取得のため`actions: read`
 - Environmentとbranch: OIDC subjectはEnvironmentを限定し、GitHub job guardとdeployment branch ruleでmainを重ねて制限する
 
 GitHubのOIDC APIが返すsubject prefixは、owner loginの後ろにowner ID、repository名の後ろにrepository IDを付ける。ID付きsubjectはRepository移管や名称再利用に対して安定した識別子となり、末尾の`:environment:production`でRequired Reviewerに保護されたProduction Environmentへ限定する。Azure Federated CredentialとGitHub Environment Variable `AZURE_FEDERATED_SUBJECT`には、Terraform output `github_actions_federated_subject`の同じ完全値を設定し、wildcardやbranch-only subjectへ緩和しない。
@@ -183,13 +209,16 @@ az role assignment list --assignee <principal-id> --all -o table
 4. GitHub上のmain HEADを確認し、その40文字完全SHAを`expected_commit_sha`へ入力してStage 2を手動実行する。validate jobはSecretなしで入力SHAと`github.sha`の完全一致、lint/test/build/guardを確認する。
 5. Stage 2のEnvironment承認後、prepare jobがOIDC login、linux/amd64 SHA image push、digest・manifest確認、Migration・公式Import・Validationを実行して停止する。
 6. artifactとjob summaryで、完全なcommit SHA、Frontend/Backend URI・digest、`linux/amd64`、DB処理成功を確認する。ACRには完全なSHA tagだけがあり、Migration imageはRunner内だけであることも確認する。
-7. Stage 3を別途手動実行し、確認済みcommit SHAと2つのdigestを入力する。Stage 3のEnvironment承認前に入力値を再照合する。
+7. Stage 3を別途手動実行し、確認済みStage 2 Run ID、commit SHAと2つのdigestを入力する。Environment承認前に指定runの成功、attempt 1、artifact所属、一意性、metadata、Stage 3 `github.sha`を再照合する。
 8. Stage 3はACR上でdigestの存在、SHA tagとの対応、platformを再検証し、タグではなくdigestでBackendを作成する。
 9. Backend内部Smoke成功後だけFrontendをexternalにし、Frontend health、HTTPS主要画面、canonical、OGP、sitemap、robotsを確認する。
+10. BackendとFrontendの対象RevisionへTrafficを100%設定し、AppとRevisionをread-backしてdigest、Ingress、port、registry、Managed Identity、Secret reference、Traffic合計100%を確認する。
 
 Planでは、対象Subscription/RG、15 add、0 change、0 destroy、0 replace、Azure DB/VNet/Private DNS/Container Appsが含まれないことを確認する。件数が変わった場合は中止して再レビューする。
 
-Frontend rollbackは直前の正常revisionへtrafficを100%戻す。Backendも同様に戻し、内部Smokeを再実行する。Migrationと公式データは自動rollbackしない。データ異常時は公開を進めず、Neon backup/branchとImporterの履歴判定を確認する。
+初回公開には直前の正常Revisionがないため、自動削除、自動rollback、自動rerunを行わない。失敗時の最終stepは、存在するContainer Apps、外部公開状態、FQDN、latest Revision、Trafficをsummaryへ記録する。Frontend external化後のSmoke失敗ではURLが到達可能な場合があるため、人間が実状態を確認して修正・削除・新規レビュー後の再実行を判断する。
+
+2回目以降のFrontend rollbackは直前の正常revisionへtrafficを100%戻す。Backendも同様に戻し、内部Smokeを再実行する。Migrationと公式データは自動rollbackしない。データ異常時は公開を進めず、Neon backup/branchとImporterの履歴判定を確認する。
 
 Secret rotationでは、Neon側password変更後に対応するEnvironment Secretだけを更新する。Backend URL変更時はworkflowを再実行して新revisionのSecret参照とhealthを確認する。Migration URLと`ESTAT_APP_ID`は次回Stage 2で検証する。旧Secret値、URL userinfo、接続エラー全文をログへ出さない。
 
