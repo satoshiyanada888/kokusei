@@ -103,6 +103,7 @@ jobs:
       AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       AZURE_FEDERATED_SUBJECT: ${{ vars.AZURE_FEDERATED_SUBJECT }}
       AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
       APP_DATABASE_USER: ${{ vars.APP_DATABASE_USER }}
       NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
 
@@ -117,12 +118,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_CONTAINER_REGISTRY APP_DATABASE_USER NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL NEON_MIGRATION_DATABASE_URL ESTAT_APP_ID)
+          required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER APP_DATABASE_USER NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL NEON_MIGRATION_DATABASE_URL ESTAT_APP_ID)
           for name in "${required[@]}"; do
             [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
           done
           case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "GITHUB_SHA must be a full commit SHA"; exit 1; }
+          scripts/production/validate-acr-login-server.sh >/dev/null
           scripts/production/validate-neon-urls.py
           echo "Stage 2 target commit: $GITHUB_SHA"
 
@@ -184,7 +186,7 @@ jobs:
         run: |
           set -euo pipefail
           az acr login --name "$AZURE_CONTAINER_REGISTRY"
-          registry="$(az acr show --name "$AZURE_CONTAINER_REGISTRY" --query loginServer -o tsv)"
+          registry="$(scripts/production/validate-acr-login-server.sh)"
           frontend_image="$registry/frontend:$GITHUB_SHA"
           backend_image="$registry/backend:$GITHUB_SHA"
           docker tag "kokusei-frontend:$GITHUB_SHA" "$frontend_image"

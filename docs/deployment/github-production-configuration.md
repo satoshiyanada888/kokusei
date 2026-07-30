@@ -38,6 +38,7 @@ Stage 2は`.github/workflows/prepare-production.yml`、Stage 3は`.github/workfl
 | `AZURE_FEDERATED_SUBJECT` | GitHub発行OIDC subjectの完全一致検証 | `github_actions_federated_subject` output | Stage 1後 | Azure login前guardで停止 |
 | `AZURE_RESOURCE_GROUP` | Production RG | `resource_group_name` output | Stage 1後 | guardで停止 |
 | `AZURE_CONTAINER_REGISTRY` | ACR名 | `container_registry_name` output | Stage 1後 | guardで停止 |
+| `ACR_LOGIN_SERVER` | ACR login server hostname | `container_registry_login_server` output | Stage 1後 | Azure login前guardで停止 |
 | `AZURE_CONTAINER_APP_ENVIRONMENT` | Container Apps Environment名 | `container_app_environment_name` output | Stage 1後 | guardで停止 |
 | `AZURE_CONTAINER_APP_FRONTEND` | Frontend app名 | `frontend_container_app_name` output | Stage 1後 | guardで停止 |
 | `AZURE_CONTAINER_APP_BACKEND` | Backend app名 | `backend_container_app_name` output | Stage 1後 | guardで停止 |
@@ -59,6 +60,7 @@ terraform output -raw github_actions_client_id
 terraform output -raw github_actions_federated_subject
 terraform output -raw resource_group_name
 terraform output -raw container_registry_name
+terraform output -raw container_registry_login_server
 terraform output -raw container_app_environment_name
 terraform output -raw frontend_container_app_name
 terraform output -raw backend_container_app_name
@@ -67,7 +69,7 @@ terraform output -raw backend_identity_id
 terraform output -raw expected_frontend_url
 ```
 
-`location`、`container_registry_login_server`、`container_app_environment_id`、`stage_1_scope`も照合用outputであり、現行workflowへの登録は不要。Environment名`production`、GitHub repository `satoshiyanada888/kokusei`、OIDC issuer/audience、人口Importerの統計表ID・公表日はレビュー可能な非SecretとしてRepositoryに固定する。Azure regionはTerraform既定`japaneast`だが、実applyではoutputとtfvarsを正とする。
+`location`、`container_app_environment_id`、`stage_1_scope`も照合用outputである。Environment名`production`、GitHub repository `satoshiyanada888/kokusei`、OIDC issuer/audience、人口Importerの統計表ID・公表日はレビュー可能な非SecretとしてRepositoryに固定する。Azure regionはTerraform既定`japaneast`だが、実applyではoutputとtfvarsを正とする。
 
 | Terraform output | 登録先 |
 |---|---|
@@ -75,6 +77,7 @@ terraform output -raw expected_frontend_url
 | `github_actions_federated_subject` | `AZURE_FEDERATED_SUBJECT` |
 | `resource_group_name` | `AZURE_RESOURCE_GROUP` |
 | `container_registry_name` | `AZURE_CONTAINER_REGISTRY` |
+| `container_registry_login_server` | `ACR_LOGIN_SERVER` |
 | `container_app_environment_name` | `AZURE_CONTAINER_APP_ENVIRONMENT` |
 | `frontend_container_app_name` | `AZURE_CONTAINER_APP_FRONTEND` |
 | `backend_container_app_name` | `AZURE_CONTAINER_APP_BACKEND` |
@@ -156,6 +159,10 @@ Azure role assignment:
 | Managed Identity Operator | Backend identity | Backend App/Smoke Jobへidentityを割当 |
 
 Subscription全体のContributor、Owner、User Access Administratorは付与しない。Frontend/Backend identityは対象ACRだけのAcrPullを持つ。Stage 1後、実Azureでscopeとprincipal IDがTerraform output/stateと一致することを確認する。
+
+GitHub deploy identityのACR権限は対象Registryの`AcrPush`だけとし、login server取得のためのReaderは追加しない。2026-07-30のStage 2では`az acr login`後の`az acr show`が管理プレーン参照権限不足で停止したため、Stage 2とStage 3は`az acr show`を使用しない。代わりにTerraform outputから転記した`AZURE_CONTAINER_REGISTRY`と`ACR_LOGIN_SERVER`をAzure login前に完全一致検証し、検証済みhostnameをtag、push、manifest platform確認、Container AppsのRegistry設定へ一貫して使用する。不一致時はACR pushまたはContainer Apps変更前に停止する。
+
+ACR名またはlogin serverが変わる場合は、同じStage 1 outputから両Environment Variableを同時に更新し、再度Workflow guardと事前レビューを行う。Issueや運用手順で`ACR_NAME`と表記する場合も、このRepositoryでの正式なVariable名は`AZURE_CONTAINER_REGISTRY`である。
 
 確認例（読み取り専用）:
 

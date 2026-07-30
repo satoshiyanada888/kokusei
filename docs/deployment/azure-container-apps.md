@@ -84,6 +84,7 @@ Variables:
 - `AZURE_SUBSCRIPTION_ID`: 対象Subscription
 - `AZURE_RESOURCE_GROUP`: Terraform `resource_group_name`
 - `AZURE_CONTAINER_REGISTRY`: Terraform `container_registry_name`
+- `ACR_LOGIN_SERVER`: Terraform `container_registry_login_server`
 - `AZURE_CONTAINER_APP_ENVIRONMENT`: Terraform `container_app_environment_name`
 - `AZURE_CONTAINER_APP_FRONTEND`: `kokusei-prod-frontend`
 - `AZURE_CONTAINER_APP_BACKEND`: `kokusei-prod-backend`
@@ -101,6 +102,8 @@ OIDC identifiersはpasswordではないためVariablesとする。実値を推�
 実行前にGitHub上の`main` HEADが事前レビュー済みcommitと一致することを確認し、40文字の完全SHAを`expected_commit_sha`へ入力する。短縮SHAや既定値は使用しない。Environment承認前のvalidate jobが入力形式を確認し、大小文字を正規化したうえで`github.sha`と完全一致しなければ停止する。事前レビューしたSHA以外のrunは承認しない。
 
 同じSHA tagが既にACRにある場合は内容にかかわらず上書きせず停止する。push後に両image digestとmanifestのOS・architectureを検証してから、次の順で進む。
+
+Stage 2とStage 3は同じ`ACR_LOGIN_SERVER`を使用し、`AZURE_CONTAINER_REGISTRY`から期待される`<registry-name>.azurecr.io`とAzure login前に完全一致検証する。login serverはTerraform `container_registry_login_server` outputからEnvironment Variableへ転記し、`az acr show`では取得しない。GitHub deploy identityは対象ACRの`AcrPush`だけを維持し、Registry一般参照用のReaderは追加しない。不一致ならStage 2はpush前、Stage 3はContainer Apps変更前に停止する。
 
 1. Neon direct URLでMigration
 2. 出生数import → validation

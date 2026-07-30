@@ -85,6 +85,7 @@ jobs:
       AZURE_FEDERATED_SUBJECT: ${{ vars.AZURE_FEDERATED_SUBJECT }}
       AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
       AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
       AZURE_CONTAINER_APP_ENVIRONMENT: ${{ vars.AZURE_CONTAINER_APP_ENVIRONMENT }}
       AZURE_CONTAINER_APP_FRONTEND: ${{ vars.AZURE_CONTAINER_APP_FRONTEND }}
       AZURE_CONTAINER_APP_BACKEND: ${{ vars.AZURE_CONTAINER_APP_BACKEND }}
@@ -102,11 +103,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          required=(TARGET_COMMIT FRONTEND_DIGEST BACKEND_DIGEST AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL)
+          required=(TARGET_COMMIT FRONTEND_DIGEST BACKEND_DIGEST AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL)
           for name in "${required[@]}"; do
             [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
           done
           case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
+          scripts/production/validate-acr-login-server.sh >/dev/null
           scripts/production/validate-neon-urls.py
 
       - name: Verify GitHub OIDC claims
@@ -135,7 +137,7 @@ jobs:
         run: |
           set -euo pipefail
           az acr login --name "$AZURE_CONTAINER_REGISTRY"
-          registry="$(az acr show --name "$AZURE_CONTAINER_REGISTRY" --query loginServer -o tsv)"
+          registry="$(scripts/production/validate-acr-login-server.sh)"
 
           verify_image() {
             repository=$1

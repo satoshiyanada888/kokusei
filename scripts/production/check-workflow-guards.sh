@@ -9,6 +9,7 @@ stage2=scripts/production/run-stage2.sh
 url_validator=scripts/production/validate-neon-urls.py
 oidc_validator=scripts/production/verify-github-oidc-claims.py
 platform_verifier=scripts/production/verify-image-platform.sh
+acr_login_server_validator=scripts/production/validate-acr-login-server.sh
 frontend_config=frontend/next.config.ts
 frontend_middleware=frontend/middleware.ts
 
@@ -124,6 +125,10 @@ require "status: 404" "$frontend_middleware"
 require 'matcher: "/_next/image"' "$frontend_middleware"
 
 require "PREPARE" "$stage2_workflow"
+require 'ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}' "$stage2_workflow"
+require "AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER" "$stage2_workflow"
+require 'az acr login --name "$AZURE_CONTAINER_REGISTRY"' "$stage2_workflow"
+require 'registry="$(scripts/production/validate-acr-login-server.sh)"' "$stage2_workflow"
 require "Build linux/amd64 application and migration images" "$stage2_workflow"
 require "docker buildx build --platform linux/amd64 --load" "$stage2_workflow"
 require "Refuse to overwrite an existing commit SHA tag" "$stage2_workflow"
@@ -143,6 +148,11 @@ require "production-stage2-\${{ github.sha }}" "$stage2_workflow"
 require "Stage 3 was not started" "$stage2_workflow"
 require "EXPECTED_WORKFLOW_PATH: .github/workflows/prepare-production.yml" "$stage2_workflow"
 
+if grep -F "az acr show" "$stage2_workflow" "$stage3_workflow" >/dev/null; then
+  echo "Production workflows must not require ACR management-plane read access" >&2
+  exit 1
+fi
+
 if grep -E '\baz containerapp (create|update|revision|ingress|job|secret|update|delete)\b' "$stage2_workflow" >/dev/null; then
   echo "Stage 2 must not create or update Container Apps, jobs, revisions, traffic, or secrets" >&2
   exit 1
@@ -157,6 +167,10 @@ require "commit_sha:" "$stage3_workflow"
 require "frontend_image_digest:" "$stage3_workflow"
 require "backend_image_digest:" "$stage3_workflow"
 require "PUBLISH" "$stage3_workflow"
+require 'ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}' "$stage3_workflow"
+require "AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER" "$stage3_workflow"
+require 'az acr login --name "$AZURE_CONTAINER_REGISTRY"' "$stage3_workflow"
+require 'registry="$(scripts/production/validate-acr-login-server.sh)"' "$stage3_workflow"
 require "git merge-base --is-ancestor" "$stage3_workflow"
 require 'FRONTEND_IMAGE=$registry/frontend@$FRONTEND_DIGEST' "$stage3_workflow"
 require 'BACKEND_IMAGE=$registry/backend@$BACKEND_DIGEST' "$stage3_workflow"
@@ -175,6 +189,20 @@ require "Verify Frontend health" "$stage3_workflow"
 require "Run public smoke tests" "$stage3_workflow"
 require "Write Stage 3 deployment summary" "$stage3_workflow"
 require "EXPECTED_WORKFLOW_PATH: .github/workflows/deploy-production.yml" "$stage3_workflow"
+
+for workflow in "$stage2_workflow" "$stage3_workflow"; do
+  login_server_validation_line=$(grep -n -m1 'validate-acr-login-server.sh >/dev/null' "$workflow" | cut -d: -f1)
+  oidc_validation_line=$(grep -n -m1 'Verify GitHub OIDC claims' "$workflow" | cut -d: -f1)
+  azure_login_line=$(grep -n -m1 'Authenticate to Azure with verified OIDC' "$workflow" | cut -d: -f1)
+  [ "$login_server_validation_line" -lt "$oidc_validation_line" ] || {
+    echo "ACR login server validation must precede OIDC access in $workflow" >&2
+    exit 1
+  }
+  [ "$login_server_validation_line" -lt "$azure_login_line" ] || {
+    echo "ACR login server validation must precede Azure login in $workflow" >&2
+    exit 1
+  }
+done
 
 if grep -E '(^|[[:space:]])docker (build|push)([[:space:]]|$)|docker buildx build' "$stage3_workflow" >/dev/null; then
   echo "Stage 3 must not build or push Docker images" >&2
@@ -198,13 +226,54 @@ for workflow in "$stage2_workflow" "$stage3_workflow"; do
   fi
 done
 
-if grep -F 'set -x' "$stage2_workflow" "$stage3_workflow" "$stage2" "$url_validator" "$oidc_validator" "$platform_verifier" >/dev/null; then
+if grep -F 'set -x' "$stage2_workflow" "$stage3_workflow" "$stage2" "$url_validator" "$oidc_validator" "$platform_verifier" "$acr_login_server_validator" >/dev/null; then
   echo "Production workflows and scripts must not enable shell tracing" >&2
   exit 1
 fi
 
 require "docker buildx imagetools inspect" "$platform_verifier"
 require "only linux/amd64 runtime platforms" "$platform_verifier"
+
+valid_acr_name=kokuseiprodacrd7btgb
+valid_acr_login_server=kokuseiprodacrd7btgb.azurecr.io
+validated_acr_login_server=$(
+  AZURE_CONTAINER_REGISTRY="$valid_acr_name" \
+    ACR_LOGIN_SERVER="$valid_acr_login_server" \
+    "$acr_login_server_validator"
+)
+[ "$validated_acr_login_server" = "$valid_acr_login_server" ] || {
+  echo "ACR login server validator did not return the verified hostname" >&2
+  exit 1
+}
+
+invalid_acr_login_server_with_newline=$(printf '%s\nx' "$valid_acr_login_server")
+for invalid_acr_login_server in \
+  "" \
+  otherregistry.azurecr.io \
+  kokuseiprodacrd7btgb \
+  "https://$valid_acr_login_server" \
+  "$valid_acr_login_server/frontend" \
+  " $valid_acr_login_server" \
+  "$valid_acr_login_server " \
+  "$invalid_acr_login_server_with_newline" \
+  KOKUSEIPRODACRD7BTGB.azurecr.io \
+  '*.azurecr.io' \
+  '$(hostname).azurecr.io'
+do
+  if AZURE_CONTAINER_REGISTRY="$valid_acr_name" \
+    ACR_LOGIN_SERVER="$invalid_acr_login_server" \
+    "$acr_login_server_validator" >/dev/null 2>&1; then
+    echo "ACR login server validator accepted an invalid hostname" >&2
+    exit 1
+  fi
+done
+
+if AZURE_CONTAINER_REGISTRY=otherregistry \
+  ACR_LOGIN_SERVER="$valid_acr_login_server" \
+  "$acr_login_server_validator" >/dev/null 2>&1; then
+  echo "ACR login server validator accepted a hostname for another registry" >&2
+  exit 1
+fi
 
 if grep -E 'docker (build|buildx build) .*\b(NEON_DATABASE_URL|NEON_MIGRATION_DATABASE_URL|ESTAT_APP_ID)\b' "$stage2_workflow" >/dev/null; then
   echo "Production secrets must not be passed as Docker build arguments" >&2
