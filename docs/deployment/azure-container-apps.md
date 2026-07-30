@@ -134,7 +134,7 @@ Migration imageの`schema_migrations`により再実行は安全で、各migrati
 
 WorkflowはSecret値を含むBackend仕様を権限`0600`の一時ディレクトリへ生成し、`az containerapp create/update --yaml`へ渡す。shellの`trap`で成功・失敗・signalを問わずディレクトリを削除し、Git、artifact、Terraform、Docker imageへ保存しない。Workflowログとjob summaryにも接続URLを出力しない。
 
-Smoke JobはMigration imageを使用しない。ACRに存在するFrontend digest imageのNode.js runtimeを使い、internal Backend APIのJSONを検証する。JobのManaged Identityは対象ACRだけの`AcrPull`を持ち、Neon Secretを受け取らない。
+Smoke JobはMigration imageを使用しない。ACRに存在するFrontend digest imageのNode.js runtimeを使い、internal Backend APIのJSONを検証する。JobのManaged Identityは対象ACRだけの`AcrPull`を持ち、Neon Secretを受け取らない。インラインNodeコードは`--args=-e "$validation_code"`で1引数として渡し、Azure CLIにNode引数を誤解釈させないため`--input-type=module`は使用しない。Job作成に失敗するとBackendだけが残る場合があるが、Backendがinternal ingressであれば外部公開ではない。
 
 Stage 3の必須Environment Variablesとして、Stage 1後に`AZURE_RESOURCE_GROUP`、`AZURE_CONTAINER_APP_ENVIRONMENT`、`AZURE_CONTAINER_APP_FRONTEND`、`AZURE_CONTAINER_APP_BACKEND`、`FRONTEND_IDENTITY_ID`、`BACKEND_IDENTITY_ID`をTerraform outputとAzure実値から登録する。Identity IDは文字列を組み立てず、`frontend_identity_id`と`backend_identity_id` outputまたは`az identity show --query id`を使う。
 

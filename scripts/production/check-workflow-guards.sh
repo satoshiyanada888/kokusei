@@ -223,6 +223,14 @@ require "Run public smoke tests" "$stage3_workflow"
 require "Write Stage 3 deployment summary" "$stage3_workflow"
 require "Indicator API payload is empty" "$stage3_workflow"
 require '"population", "births", "unemployment-rate"' "$stage3_workflow"
+if grep -F -- '--input-type=module' "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 Smoke Job must not pass --input-type=module through Azure CLI" >&2
+  exit 1
+fi
+if [ "$(grep -F -c -- '--args=-e "$validation_code"' "$stage3_workflow")" -ne 2 ]; then
+  echo "Stage 3 Smoke Job create and update must pass Node code with --args=-e" >&2
+  exit 1
+fi
 require "az containerapp revision show" "$stage3_workflow"
 require 'EXPECTED_IMAGE="$BACKEND_IMAGE"' "$stage3_workflow"
 require 'EXPECTED_IMAGE="$FRONTEND_IMAGE"' "$stage3_workflow"
