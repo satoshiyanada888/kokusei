@@ -179,12 +179,15 @@ Azure role assignment:
 
 | Role | Scope | 用途 |
 |---|---|---|
-| Container Apps Contributor | Production Resource Group | Container App/Job作成・更新 |
+| Container Apps Contributor | Production Resource Group | Container App作成・更新 |
+| Container Apps Jobs Contributor | Production Resource Group | 内部Smoke Job作成・更新・実行・状態確認 |
 | AcrPush | 対象ACR | SHA image push |
 | Managed Identity Operator | Frontend identity | Frontend Appへidentityを割当 |
 | Managed Identity Operator | Backend identity | Backend App/Smoke Jobへidentityを割当 |
 
 Subscription全体のContributor、Owner、User Access Administratorは付与しない。Frontend/Backend identityは対象ACRだけのAcrPullを持つ。Stage 1後、実Azureでscopeとprincipal IDがTerraform output/stateと一致することを確認する。
+
+`Container Apps Contributor`は`Microsoft.App/containerApps/*`を対象とし、`Microsoft.App/jobs/write`を含まない。Stage 3の内部Smoke Jobを作成・更新・開始して実行状態を確認するため、Job専用の`Container Apps Jobs Contributor`をProduction Resource Groupに限定して付与する。この組み込みロールにはJob削除権限も含まれるが、Workflowへ自動削除処理は追加しない。Stage 3はOIDCでこのidentityを使用し、Client Secretは使用しない。Smoke Job以外の権限へ広げるSubscription全体のContributorは使用しない。
 
 GitHub deploy identityのACR権限は対象Registryの`AcrPush`だけとし、login server取得のためのReaderは追加しない。2026-07-30のStage 2では`az acr login`後の`az acr show`が管理プレーン参照権限不足で停止したため、Stage 2とStage 3は`az acr show`を使用しない。代わりにTerraform outputから転記した`AZURE_CONTAINER_REGISTRY`と`ACR_LOGIN_SERVER`をAzure login前に完全一致検証し、検証済みhostnameをtag、push、manifest platform確認、Container AppsのRegistry設定へ一貫して使用する。不一致時はACR pushまたはContainer Apps変更前に停止する。
 

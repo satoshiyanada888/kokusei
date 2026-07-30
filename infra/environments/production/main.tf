@@ -96,6 +96,13 @@ resource "azurerm_role_assignment" "github_container_apps" {
   skip_service_principal_aad_check = true
 }
 
+resource "azurerm_role_assignment" "github_container_apps_jobs" {
+  scope                            = azurerm_resource_group.main.id
+  role_definition_name             = "Container Apps Jobs Contributor"
+  principal_id                     = azurerm_user_assigned_identity.github_deploy.principal_id
+  skip_service_principal_aad_check = true
+}
+
 resource "azurerm_role_assignment" "github_acr_push" {
   scope                            = azurerm_container_registry.main.id
   role_definition_name             = "AcrPush"
