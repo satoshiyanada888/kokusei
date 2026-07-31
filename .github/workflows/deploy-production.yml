@@ -421,6 +421,7 @@ jobs:
           trap cleanup EXIT HUP INT TERM
 
           environment_id="$(az containerapp env show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_ENVIRONMENT" --query id -o tsv)"
+          site_url="${NEXT_PUBLIC_SITE_URL%/}"
           specification="$temporary_directory/frontend-container-app.json"
           internal_specification="$temporary_directory/frontend-container-app-internal.json"
           jq -n \
@@ -430,6 +431,7 @@ jobs:
             --arg image "$FRONTEND_IMAGE" \
             --arg revision "$REVISION_SUFFIX" \
             --arg backend_url "$BACKEND_URL" \
+            --arg site_url "$site_url" \
             '{
               identity: {type: "UserAssigned", userAssignedIdentities: {($identity_id): {}}},
               properties: {
@@ -445,7 +447,10 @@ jobs:
                     name: "frontend",
                     image: $image,
                     resources: {cpu: 0.25, memory: "0.5Gi"},
-                    env: [{name: "INTERNAL_API_URL", value: $backend_url}],
+                    env: [
+                      {name: "INTERNAL_API_URL", value: $backend_url},
+                      {name: "NEXT_PUBLIC_SITE_URL", value: $site_url}
+                    ],
                     probes: [
                       {type: "Startup", httpGet: {path: "/health", port: 3000}, initialDelaySeconds: 5, periodSeconds: 5, failureThreshold: 10},
                       {type: "Liveness", httpGet: {path: "/health", port: 3000}, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 3},
@@ -470,7 +475,7 @@ jobs:
           fi
 
           frontend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.configuration.ingress.fqdn -o tsv)"
-          [ "https://$frontend_fqdn" = "${NEXT_PUBLIC_SITE_URL%/}" ] || { echo "Frontend FQDN does not match NEXT_PUBLIC_SITE_URL"; exit 1; }
+          [ "https://$frontend_fqdn" = "$site_url" ] || { echo "Frontend FQDN does not match NEXT_PUBLIC_SITE_URL"; exit 1; }
           frontend_revision="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.latestRevisionName -o tsv)"
           [ -n "$frontend_revision" ] || { echo "Frontend active revision is missing"; exit 1; }
           az containerapp ingress traffic set \
@@ -499,6 +504,39 @@ jobs:
             EXPECTED_IDENTITY_ID="$FRONTEND_IDENTITY_ID" \
             scripts/production/verify-container-app-state.py \
               "$frontend_app_json" "$frontend_revision_json"
+
+          jq -e \
+            --arg backend_url "$BACKEND_URL" \
+            --arg site_url "$site_url" \
+            '
+              [
+                .properties.template.containers[]
+                | select(.name == "frontend")
+                | .env[]
+                | select(.name == "INTERNAL_API_URL" and .value == $backend_url)
+              ] | length == 1
+            ' "$frontend_revision_json" >/dev/null || {
+              echo "Frontend INTERNAL_API_URL read-back does not match"
+              exit 1
+            }
+          jq -e \
+            --arg site_url "$site_url" \
+            '
+              [
+                .properties.template.containers[]
+                | select(.name == "frontend")
+                | .env[]
+                | select(
+                    .name == "NEXT_PUBLIC_SITE_URL"
+                    and (.value | sub("/+$"; "")) == $site_url
+                    and (.value | startswith("https://"))
+                    and (.value | test("localhost|127[.]0[.]0[.]1"; "i") | not)
+                  )
+              ] | length == 1
+            ' "$frontend_revision_json" >/dev/null || {
+              echo "Frontend NEXT_PUBLIC_SITE_URL read-back does not match the production HTTPS URL"
+              exit 1
+            }
 
           {
             echo "FRONTEND_URL=https://$frontend_fqdn"
@@ -533,8 +571,14 @@ jobs:
           printf '%s' "$html" | grep -F "property=\"og:url\" content=\"$site/\""
           printf '%s' "$html" | grep -F "property=\"og:image\" content=\"$site/og-image.png\""
           printf '%s' "$html" | grep -F "name=\"twitter:image\" content=\"$site/og-image.png\""
-          curl --fail --silent --show-error "$site/sitemap.xml" | grep -F "$site/"
-          curl --fail --silent --show-error "$site/robots.txt" | grep -F "$site/sitemap.xml"
+          sitemap="$(curl --fail --silent --show-error "$site/sitemap.xml")"
+          robots="$(curl --fail --silent --show-error "$site/robots.txt")"
+          printf '%s' "$sitemap" | grep -F "$site/"
+          printf '%s' "$robots" | grep -F "$site/sitemap.xml"
+          if printf '%s\n%s\n%s' "$html" "$sitemap" "$robots" | grep -E '(localhost|127[.]0[.]0[.]1)' >/dev/null; then
+            echo "Public SEO metadata must not reference localhost"
+            exit 1
+          fi
 
       - name: Write Stage 3 deployment summary
         shell: bash

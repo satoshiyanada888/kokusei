@@ -207,6 +207,7 @@ require 'az acr login --name "$AZURE_CONTAINER_REGISTRY"' "$stage3_workflow"
 require 'registry="$(scripts/production/validate-acr-login-server.sh)"' "$stage3_workflow"
 require 'FRONTEND_IMAGE=$registry/frontend@$FRONTEND_DIGEST' "$stage3_workflow"
 require 'BACKEND_IMAGE=$registry/backend@$BACKEND_DIGEST' "$stage3_workflow"
+require 'NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}' "$stage3_workflow"
 require "digest is not tagged with the requested commit SHA" "$stage3_workflow"
 require "scripts/production/verify-image-platform.sh" "$stage3_workflow"
 require "Create or update internal Backend" "$stage3_workflow"
@@ -221,6 +222,20 @@ require "chmod 0600" "$stage3_workflow"
 require "Verify Frontend health" "$stage3_workflow"
 require "Run public smoke tests" "$stage3_workflow"
 require "Write Stage 3 deployment summary" "$stage3_workflow"
+require '--build-arg NEXT_PUBLIC_SITE_URL="$NEXT_PUBLIC_SITE_URL"' "$stage2_workflow"
+require 'site_url="${NEXT_PUBLIC_SITE_URL%/}"' "$stage3_workflow"
+require '--arg site_url "$site_url"' "$stage3_workflow"
+require '{name: "INTERNAL_API_URL", value: $backend_url}' "$stage3_workflow"
+require '{name: "NEXT_PUBLIC_SITE_URL", value: $site_url}' "$stage3_workflow"
+require 'Frontend INTERNAL_API_URL read-back does not match' "$stage3_workflow"
+require 'Frontend NEXT_PUBLIC_SITE_URL read-back does not match the production HTTPS URL' "$stage3_workflow"
+require '<link rel=\"canonical\" href=\"$site/\"' "$stage3_workflow"
+require 'property=\"og:url\" content=\"$site/\"' "$stage3_workflow"
+require 'property=\"og:image\" content=\"$site/og-image.png\"' "$stage3_workflow"
+require 'name=\"twitter:image\" content=\"$site/og-image.png\"' "$stage3_workflow"
+require 'printf '\''%s'\'' "$sitemap" | grep -F "$site/"' "$stage3_workflow"
+require 'printf '\''%s'\'' "$robots" | grep -F "$site/sitemap.xml"' "$stage3_workflow"
+require "Public SEO metadata must not reference localhost" "$stage3_workflow"
 require "Indicator API payload is empty" "$stage3_workflow"
 require '"population", "births", "unemployment-rate"' "$stage3_workflow"
 if grep -F -- '--input-type=module' "$stage3_workflow" >/dev/null; then
@@ -233,6 +248,33 @@ if grep -F -- '--args=-e "$validation_code"' "$stage3_workflow" >/dev/null; then
 fi
 if [ "$(grep -F -c -- '--args="--eval=$validation_code"' "$stage3_workflow")" -ne 2 ]; then
   echo "Stage 3 Smoke Job create and update must pass Node code as one --eval argument" >&2
+  exit 1
+fi
+frontend_deployment_step=$(
+  awk '
+    /^      - name: Create or update Frontend after Backend validation$/ { capture = 1 }
+    capture && /^      - name: / && !/Create or update Frontend after Backend validation/ { exit }
+    capture { print }
+  ' "$stage3_workflow"
+)
+if [ "$(printf '%s\n' "$frontend_deployment_step" | grep -F -c -- '{name: "NEXT_PUBLIC_SITE_URL", value: $site_url}')" -ne 1 ]; then
+  echo "Stage 3 Frontend shared create/update specification must set one runtime NEXT_PUBLIC_SITE_URL" >&2
+  exit 1
+fi
+printf '%s\n' "$frontend_deployment_step" | grep -F 'az containerapp create -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND"' >/dev/null || {
+  echo "Stage 3 Frontend create must use the shared runtime specification" >&2
+  exit 1
+}
+printf '%s\n' "$frontend_deployment_step" | grep -F -- '--yaml "$internal_specification"' >/dev/null || {
+  echo "Stage 3 Frontend internal create must retain the runtime environment" >&2
+  exit 1
+}
+if [ "$(printf '%s\n' "$frontend_deployment_step" | grep -F -c -- '--yaml "$specification"')" -ne 2 ]; then
+  echo "Stage 3 Frontend existing-app update and post-create update must use the shared runtime specification" >&2
+  exit 1
+fi
+if grep -F 'http://localhost:3000' "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 must not hard-code the local site URL" >&2
   exit 1
 fi
 validation_code=$(cat <<'JAVASCRIPT'

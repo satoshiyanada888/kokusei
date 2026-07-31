@@ -129,7 +129,7 @@ Migration imageの`schema_migrations`により再実行は安全で、各migrati
 - `NEON_DATABASE_URL`をAzure Container Apps Secret `neon-database-url`へCLIで登録し、`DATABASE_URL=secretref:neon-database-url`。Terraformへ渡さない。
 - pgx poolは1 replicaあたり最大5接続（最大2 replicaで合計最大10接続）。既定のconnect timeoutとstatement timeoutは各10秒で、URLに明示値があればそれを優先する。起動時DB pingはNeon/Container Apps双方のcold startを考慮して最大約40秒retryする。
 - Backend health、指標一覧、人口・出生数・完全失業率の詳細APIを同一Container Apps Environment内の手動Trigger Smoke Jobで確認する。配列が空でないこと、3 slugが存在すること、一覧と詳細の最新値がnullまたは空文字でないことも検証する。
-- 成功後にFrontendをexternal ingress、port 3000、0.25 vCPU/0.5 GiB、min 0/max 2で作成/更新し、server-side `INTERNAL_API_URL`でBackend internal FQDNへ接続する。Frontendの軽量な`/health`をStartup/Liveness/Readiness probeに使用する。ブラウザからBackendへ直接接続しない。
+- 成功後にFrontendをexternal ingress、port 3000、0.25 vCPU/0.5 GiB、min 0/max 2で作成/更新し、server-side `INTERNAL_API_URL`でBackend internal FQDNへ接続する。`NEXT_PUBLIC_SITE_URL`はStage 2のbuild argに加え、Stage 3で同じGitHub Environment Variableを実行時環境変数として設定する。Frontendの軽量な`/health`をStartup/Liveness/Readiness probeに使用する。ブラウザからBackendへ直接接続しない。
 - BackendとFrontendは対象RevisionへTrafficを明示的に100%割り当てる。AzureからAppとRevisionをread-backし、名前、Ingress、port、digest URI、ACR server、Managed Identity、Secret reference、active Revision、Traffic合計100%と旧Revision 0%を検証する。Frontendはexternal、Backendはinternalでなければ失敗する。
 
 WorkflowはSecret値を含むBackend仕様を権限`0600`の一時ディレクトリへ生成し、`az containerapp create/update --yaml`へ渡す。shellの`trap`で成功・失敗・signalを問わずディレクトリを削除し、Git、artifact、Terraform、Docker imageへ保存しない。Workflowログとjob summaryにも接続URLを出力しない。
@@ -152,7 +152,9 @@ Next.js 15.5.22のstandalone成果物には`sharp 0.34.5`が含まれ、`GHSA-f8
 
 Container Apps Environmentのdefault domainと固定app名から、Terraform `expected_frontend_url`が予定HTTPS FQDNを出力する。Stage 1 apply後にこの値を確認し、Azure Portal/CLIで想定nameとdomainを照合してGitHub Variableへ設定する。これにより仮Frontend app/imageを作らず正式buildできる。
 
-初回だけWorkflowはFrontendをinternal ingressで作成し、実FQDNと`NEXT_PUBLIC_SITE_URL`が一致した後にexternalへ変更する。不一致ならinternalのまま失敗するため、localhost/仮URLを公開状態に残さない。URL変更時はVariable更新後に新commit SHAのFrontendを再build/deployする。最後にcanonical、`og:url`、`og:image`、Twitter image、sitemap、robotsをHTTPS URLで検証する。
+初回だけWorkflowはFrontendをinternal ingressで作成し、実FQDNと`NEXT_PUBLIC_SITE_URL`が一致した後にexternalへ変更する。不一致ならinternalのまま失敗するため、localhost/仮URLを公開状態に残さない。URL変更時はVariable更新後に新commit SHAのFrontendを再build/deployする。
+
+`NEXT_PUBLIC_SITE_URL`はビルド時と実行時の両方で必要である。動的metadata、sitemap、OGPはContainer App起動後に評価される経路があり、実行時設定がないと`http://localhost:3000`へフォールバックする可能性がある。WorkflowはFrontend Revisionから`INTERNAL_API_URL`と`NEXT_PUBLIC_SITE_URL`をread-backし、後者がGitHub Environment VariableのHTTPS URLと一致し、localhostを含まないことを確認する。公開Smokeではcanonical、`og:url`、`og:image`、Twitter image、sitemap、robotsを確認し、ページ表示の成功だけでは公開完了と判定しない。
 
 ## scale to zeroと障害対応
 
