@@ -229,8 +229,14 @@ require '{name: "INTERNAL_API_URL", value: $backend_url}' "$stage3_workflow"
 require '{name: "NEXT_PUBLIC_SITE_URL", value: $site_url}' "$stage3_workflow"
 require 'Frontend INTERNAL_API_URL read-back does not match' "$stage3_workflow"
 require 'Frontend NEXT_PUBLIC_SITE_URL read-back does not match the production HTTPS URL' "$stage3_workflow"
-require '<link rel=\"canonical\" href=\"$site/\"' "$stage3_workflow"
-require 'property=\"og:url\" content=\"$site/\"' "$stage3_workflow"
+require 'normalize_public_url() {' "$stage3_workflow"
+require 'printf '\''%s'\'' "${value%/}"' "$stage3_workflow"
+require 'canonical_url="${BASH_REMATCH[1]}"' "$stage3_workflow"
+require 'og_url="${BASH_REMATCH[1]}"' "$stage3_workflow"
+require 'actual_normalized="$(normalize_public_url "$actual")"' "$stage3_workflow"
+require 'if [ "$actual_normalized" != "$expected_normalized" ]; then' "$stage3_workflow"
+require 'assert_public_url "canonical" "$canonical_url"' "$stage3_workflow"
+require 'assert_public_url "og:url" "$og_url"' "$stage3_workflow"
 require 'property=\"og:image\" content=\"$site/og-image.png\"' "$stage3_workflow"
 require 'name=\"twitter:image\" content=\"$site/og-image.png\"' "$stage3_workflow"
 require 'printf '\''%s'\'' "$sitemap" | grep -F "$site/"' "$stage3_workflow"
@@ -238,6 +244,60 @@ require 'printf '\''%s'\'' "$robots" | grep -F "$site/sitemap.xml"' "$stage3_wor
 require "Public SEO metadata must not reference localhost" "$stage3_workflow"
 require "Indicator API payload is empty" "$stage3_workflow"
 require '"population", "births", "unemployment-rate"' "$stage3_workflow"
+if grep -F '<link rel=\"canonical\" href=\"$site/\"' "$stage3_workflow" >/dev/null ||
+  grep -F 'property=\"og:url\" content=\"$site/\"' "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 public URL checks must not require a trailing slash with fixed grep" >&2
+  exit 1
+fi
+
+normalize_public_url() {
+  value=$1
+  [ -n "$value" ] || return 1
+  printf '%s' "${value%/}"
+}
+
+public_urls_match() {
+  expected_normalized=$(normalize_public_url "$1") || return 1
+  actual_normalized=$(normalize_public_url "$2") || return 1
+  [ "$expected_normalized" = "$actual_normalized" ]
+}
+
+require_url_match() {
+  public_urls_match "$1" "$2" || {
+    echo "Expected public URLs to match after trailing-slash normalization: $1 $2" >&2
+    exit 1
+  }
+}
+
+require_url_mismatch() {
+  if public_urls_match "https://example.com" "$1"; then
+    echo "Expected public URL mismatch: $1" >&2
+    exit 1
+  fi
+}
+
+require_url_match "https://example.com" "https://example.com"
+require_url_match "https://example.com" "https://example.com/"
+require_url_match "https://example.com/" "https://example.com"
+require_url_match "https://example.com/" "https://example.com/"
+require_url_mismatch "http://example.com"
+require_url_mismatch "https://localhost:3000"
+require_url_mismatch "https://example.org"
+require_url_mismatch "https://example.com/path"
+require_url_mismatch ""
+require_url_mismatch "https://example.com/?x=1"
+
+public_smoke_step=$(
+  awk '
+    /^      - name: Run public smoke tests$/ { capture = 1 }
+    capture && /^      - name: / && !/Run public smoke tests/ { exit }
+    capture { print }
+  ' "$stage3_workflow"
+)
+if printf '%s\n' "$public_smoke_step" | grep -F '|| true' >/dev/null; then
+  echo "Stage 3 public smoke tests must not ignore failures" >&2
+  exit 1
+fi
 if grep -F -- '--input-type=module' "$stage3_workflow" >/dev/null; then
   echo "Stage 3 Smoke Job must not pass --input-type=module through Azure CLI" >&2
   exit 1

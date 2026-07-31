@@ -556,6 +556,26 @@ jobs:
         run: |
           set -euo pipefail
           site="${NEXT_PUBLIC_SITE_URL%/}"
+          normalize_public_url() {
+            local value="$1"
+            [ -n "$value" ] || return 1
+            printf '%s' "${value%/}"
+          }
+          assert_public_url() {
+            local label="$1"
+            local actual="$2"
+            local expected_normalized
+            local actual_normalized
+            expected_normalized="$(normalize_public_url "$site")"
+            if ! actual_normalized="$(normalize_public_url "$actual")"; then
+              echo "$label URL is missing"
+              exit 1
+            fi
+            if [ "$actual_normalized" != "$expected_normalized" ]; then
+              echo "$label URL does not match: expected=$expected_normalized actual=$actual_normalized"
+              exit 1
+            fi
+          }
           for path in / /indicators/population /indicators/births /indicators/unemployment-rate /updates /robots.txt /sitemap.xml /og-image.png; do
             curl --fail --silent --show-error --location --retry 12 --retry-all-errors --retry-delay 5 --output /dev/null "$site$path"
           done
@@ -567,8 +587,16 @@ jobs:
             echo "Public dashboard reported an empty indicator list"
             exit 1
           fi
-          printf '%s' "$html" | grep -F "<link rel=\"canonical\" href=\"$site/\""
-          printf '%s' "$html" | grep -F "property=\"og:url\" content=\"$site/\""
+          canonical_url=
+          if [[ "$html" =~ \<link\ rel=\"canonical\"\ href=\"([^\"]*)\" ]]; then
+            canonical_url="${BASH_REMATCH[1]}"
+          fi
+          og_url=
+          if [[ "$html" =~ property=\"og:url\"\ content=\"([^\"]*)\" ]]; then
+            og_url="${BASH_REMATCH[1]}"
+          fi
+          assert_public_url "canonical" "$canonical_url"
+          assert_public_url "og:url" "$og_url"
           printf '%s' "$html" | grep -F "property=\"og:image\" content=\"$site/og-image.png\""
           printf '%s' "$html" | grep -F "name=\"twitter:image\" content=\"$site/og-image.png\""
           sitemap="$(curl --fail --silent --show-error "$site/sitemap.xml")"
