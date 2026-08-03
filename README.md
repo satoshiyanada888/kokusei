@@ -19,12 +19,24 @@
 
 ## アーキテクチャ
 
+本番公開時のデータ参照経路:
+
 ```text
 Browser → Next.js (App Router / TypeScript / Tailwind / Recharts)
                     ↓ REST
           Go API (handler → service → repository)
                     ↓
-                PostgreSQL
+      Azure Blob Storage (private JSON snapshot)
+```
+
+公式データを公開snapshotへ変換するStage 2:
+
+```text
+公的機関の一次情報 → Import・検証（Neon PostgreSQL）
+                              ↓
+                    immutable JSON snapshot
+                              ↓
+                Azure Blob Storage + current.json
 ```
 
 モノレポの主な構成は次のとおりです。
@@ -36,11 +48,11 @@ database/   PostgreSQL migration と seed
 docs/       設計メモ
 ```
 
-`IndicatorRepository` と `UpdateHistoryRepository` がDBアクセスを隠蔽します。将来の外部取得処理は `IndicatorDataProvider` を実装し、保存処理とは独立して追加できます。PostgreSQLでは `numeric(24,6)`、JSONでは10進文字列を使い、バイナリ浮動小数点への暗黙変換を避けています。詳細は [docs/architecture.md](docs/architecture.md) を参照してください。
+`IndicatorRepository` と `UpdateHistoryRepository` がデータ参照先を隠蔽します。ローカル開発ではPostgreSQL、本番BackendではAzure Blob Storageの公式JSON snapshotを使用します。外部取得処理は `IndicatorDataProvider` に分離しています。PostgreSQLでは `numeric(24,6)`、JSONでは10進文字列を使い、バイナリ浮動小数点への暗黙変換を避けています。詳細は [docs/architecture.md](docs/architecture.md) を参照してください。
 
 ## Azure Container Appsへの本番デプロイ
 
-Azure Container Registry、Azure Container Apps、Neon PostgreSQL、GitHub Actions OIDCを使う本番構成を`infra/`と`.github/workflows/`に用意しています。Stage 1（Azure基盤）、Stage 2（Neon Migration・公式データ・image）、Stage 3（公開）に分け、Stage 1ではアプリを作成・公開しません。Secret、Remote State、Migration、公式データ、コスト、ロールバックの手順は [docs/deployment/azure-container-apps.md](docs/deployment/azure-container-apps.md) を参照してください。
+Azure Container Registry、Azure Container Apps、Azure Blob Storage、Neon PostgreSQL、GitHub Actions OIDCを使う本番構成を`infra/`と`.github/workflows/`に用意しています。Stage 1（Azure基盤）、Stage 2（Neon Migration・公式データ検証・image・Blob snapshot）、Stage 3（公開）に分けています。本番Backendはprivate Blob containerをManaged Identityで読み、NeonはStage 2のデータ生成・検証に使用します。Secret、Remote State、Migration、公式データ、コスト、ロールバックの手順は [docs/deployment/azure-container-apps.md](docs/deployment/azure-container-apps.md) を参照してください。
 
 Terraformコードの作成だけではAzureリソースは作られません。Subscription、権限、料金、Resource Group、名前衝突を確認し、`terraform plan`の内容について承認を得てからapplyしてください。Neon pooled/direct URLはGitHub `production` Environment Secretsからのみ渡し、Git、tfvars、saved plan、Terraform Stateへ保存しません。出生数と完全失業率の公式取得仕様は [docs/data-sources/births-and-unemployment.md](docs/data-sources/births-and-unemployment.md) を参照してください。
 

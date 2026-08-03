@@ -4,11 +4,11 @@
 
 ## システム構成
 
-KOKUSEIは、Next.js Frontend、Go Backend、PostgreSQL Databaseからなる
-モノレポである。ローカル開発はDocker Compose、本番公開は
-Azure Container AppsとNeon PostgreSQLを使用する。Phase 1では、同じAPI契約を
-Azure Blob Storageの公式JSON snapshotから提供できるRepositoryも実装済みだが、
-Productionの既定は引き続きNeonである。
+KOKUSEIは、Next.js Frontend、Go Backend、複数のrepository実装からなる
+モノレポである。ローカル開発はDocker ComposeとPostgreSQLを使用する。本番公開は
+Azure Container Apps上のBackendが、Managed IdentityでprivateなAzure Blob
+Storageから公式JSON snapshotを読み込む。Neon PostgreSQLはStage 2の公式データ
+Import・検証とsnapshot生成に使用し、公開Backendのデータ参照先にはしない。
 
 ```text
 Browser
@@ -20,7 +20,14 @@ Next.js Frontend
 Go REST API
   |
   v
-PostgreSQL
+Azure Blob Storage (private JSON snapshot)
+
+Stage 2 data pipeline
+  |
+  +-- Official data providers
+  +-- Neon PostgreSQL migration / import / validation
+  +-- Immutable JSON snapshot
+  +-- Azure Blob Storage upload and current.json switch
 ```
 
 Backendの永続化先は`DATA_STORE=postgres|blob|file`で選択する。`blob`は
@@ -32,12 +39,15 @@ commit SHA固定の`dataset.json`を取得する。`file`は同じschemaをAzure
 
 ## データフロー
 
-1. 外部データProviderが公的機関の一次情報を取得し、値とメタデータを検証する。
-2. Backendのserviceがrepositoryを通してPostgreSQLへ保存する。
-3. BackendがREST APIから10進文字列として統計値を返す。
-4. FrontendがAPIを取得し、一覧、詳細、グラフ、更新履歴として表示する。
+1. Stage 2で外部データProviderが公的機関の一次情報を取得する。
+2. Neon PostgreSQLへImportし、指標別・横断Validationを行う。
+3. 検証済みデータからimmutableな`dataset.json`を生成してBlobへupload・read-backする。
+4. 最後に`current.json`を切り替え、本番Backendが新しいsnapshotを参照する。
+5. BackendがREST APIから10進文字列として統計値を返す。
+6. FrontendがAPIを取得し、一覧、詳細、グラフ、更新履歴として表示する。
 
 外部取得失敗時は既存データを維持し、開発用データと公式データを区別する。
+ローカル開発では従来どおりPostgreSQL repositoryを使用する。
 
 Blob snapshot経路ではStage 2が3つのProviderから正規化済み公式値を取得し、
 全検証後に`dataset.json`をupload・read-backする。最後に`current.json`を更新する
@@ -68,13 +78,14 @@ APIの既存レスポンス形式は後方互換性を維持し、統計値は�
 - ローカル: Docker ComposeによるFrontend、Backend、PostgreSQL
 - 本番Stage 1: Azure Container Registry、Container Apps Environment、
   Log Analytics、Managed Identity、OIDC/RBAC
-- 本番Stage 2: immutable image build/push、Neon Migration、公式データImportとValidation
+- 本番Stage 2: immutable image build/push、Neon Migration、公式データImportとValidation、
+  JSON snapshotのBlob upload・read-back・`current.json`切替
 - 本番Stage 3: digest固定のContainer Apps作成、read-back、Smoke Test、HTTPS公開
-- Blob Phase 1: app-data専用StorageV2、private container、Backend Readerと
-  GitHub deploy Contributorのcontainer限定RBAC。Terraform applyとProduction切替は未実施
+- 本番データ参照: app-data専用StorageV2、private container、Backend Readerと
+  GitHub deploy Contributorのcontainer限定RBAC。Productionは`DATA_STORE=blob`
 
 本番運用の詳細は
-[Azure Container Apps + Neon 初回公開手順](../deployment/azure-container-apps.md)
+[Azure Container Apps本番公開手順](../deployment/azure-container-apps.md)
 を参照する。
 
 ## ディレクトリ構成
