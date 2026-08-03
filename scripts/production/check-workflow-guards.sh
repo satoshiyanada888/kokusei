@@ -384,6 +384,10 @@ require "EXPECTED_WORKFLOW_PATH: .github/workflows/deploy-production.yml" "$stag
 require '"traffic total"' "$container_app_state_validator"
 require '"target revision traffic"' "$container_app_state_validator"
 require '"no old revision traffic"' "$container_app_state_validator"
+require "def normalize_resource_id" "$container_app_state_validator"
+require "normalize_resource_id(registry.get(\"identity\"))" "$container_app_state_validator"
+require "normalize_resource_id(expected_identity)" "$container_app_state_validator"
+require '"different Managed Identity"' "$container_app_state_validator"
 
 evidence_line=$(grep -n -m1 'Bind Stage 3 inputs to the exact successful Stage 2 artifact' "$stage3_workflow" | cut -d: -f1)
 publish_line=$(grep -n -m1 '^  publish:$' "$stage3_workflow" | cut -d: -f1)

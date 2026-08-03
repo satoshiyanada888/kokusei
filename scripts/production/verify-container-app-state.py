@@ -38,6 +38,11 @@ def required_environment(name: str) -> str:
     return value
 
 
+def normalize_resource_id(value: object) -> str:
+    """Normalize an Azure Resource ID for case-insensitive comparison."""
+    return value.casefold() if isinstance(value, str) else ""
+
+
 def validate_state(
     app: dict[str, Any],
     revision: dict[str, Any],
@@ -72,12 +77,18 @@ def validate_state(
         "active revision": revision.get("properties", {}).get("active") is True,
         "registry server": any(
             registry.get("server") == expected_registry
-            and registry.get("identity") == expected_identity
+            and normalize_resource_id(registry.get("identity"))
+            == normalize_resource_id(expected_identity)
             for registry in configuration.get("registries", [])
             if isinstance(registry, dict)
         ),
-        "managed identity": expected_identity
-        in app.get("identity", {}).get("userAssignedIdentities", {}),
+        "managed identity": normalize_resource_id(expected_identity)
+        in {
+            normalize_resource_id(identity)
+            for identity in app.get("identity", {}).get(
+                "userAssignedIdentities", {}
+            )
+        },
     }
     if expected_external:
         checks["Frontend FQDN"] = bool(ingress.get("fqdn"))
@@ -267,6 +278,47 @@ def self_test() -> None:
     )
 
     backend, backend_revision, backend_expected = fixture("backend")
+    case_variant_identity = (
+        "/subscriptions/00000000-0000-0000-0000-000000000000/"
+        "resourcegroups/rg-kokusei-prod/providers/"
+        "microsoft.managedidentity/userassignedidentities/kokusei-prod-backend"
+    )
+    case_variant_backend = deepcopy(backend)
+    case_variant_backend["identity"]["userAssignedIdentities"] = {
+        case_variant_identity: {}
+    }
+    case_variant_backend["properties"]["configuration"]["registries"][0][
+        "identity"
+    ] = case_variant_identity
+    case_variant_expected = dict(backend_expected)
+    case_variant_expected["expected_identity"] = (
+        "/subscriptions/00000000-0000-0000-0000-000000000000/"
+        "resourceGroups/rg-kokusei-prod/providers/"
+        "Microsoft.ManagedIdentity/userAssignedIdentities/kokusei-prod-backend"
+    )
+    validate_state(
+        case_variant_backend,
+        backend_revision,
+        **case_variant_expected,
+    )
+    wrong_identity_backend = deepcopy(case_variant_backend)
+    wrong_identity = case_variant_identity.replace(
+        "kokusei-prod-backend", "different-backend"
+    )
+    wrong_identity_backend["identity"]["userAssignedIdentities"] = {
+        wrong_identity: {}
+    }
+    wrong_identity_backend["properties"]["configuration"]["registries"][0][
+        "identity"
+    ] = wrong_identity
+    expect_failure(
+        lambda: validate_state(
+            wrong_identity_backend,
+            backend_revision,
+            **case_variant_expected,
+        ),
+        "different Managed Identity",
+    )
     backend_external = deepcopy(backend)
     backend_external["properties"]["configuration"]["ingress"]["external"] = True
     expect_failure(
@@ -303,8 +355,9 @@ def self_test() -> None:
     )
     print(
         "Container App read-back validator self-test passed: normal Frontend/"
-        "Backend, Blob Backend, Traffic 0%, Traffic total mismatch, Frontend internal, "
-        "Backend external, revision digest mismatch"
+        "Backend, case-equivalent Resource ID, different Managed Identity, Blob Backend, "
+        "Traffic 0%, Traffic total mismatch, Frontend internal, Backend external, "
+        "revision digest mismatch"
     )
 
 
