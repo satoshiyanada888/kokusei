@@ -48,6 +48,11 @@ def validate_state(
     expected_image: str,
     expected_registry: str,
     expected_identity: str,
+    expected_data_store: str = "postgres",
+    expected_storage_account: str = "",
+    expected_storage_container: str = "",
+    expected_current_blob: str = "current.json",
+    expected_backend_client_id: str = "",
 ) -> None:
     if kind not in {"frontend", "backend"}:
         raise StateError("Container App kind must be frontend or backend")
@@ -118,11 +123,34 @@ def validate_state(
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         }
         if kind == "backend":
-            database_url = environment.get("DATABASE_URL", {})
-            checks["Backend database secret reference"] = (
-                database_url.get("secretRef") == "neon-database-url"
-                and "value" not in database_url
-            )
+            data_store = environment.get("DATA_STORE", {})
+            checks["Backend data store"] = data_store.get("value") == expected_data_store
+            if expected_data_store == "blob":
+                checks["Backend storage account"] = (
+                    environment.get("AZURE_STORAGE_ACCOUNT_NAME", {}).get("value")
+                    == expected_storage_account
+                )
+                checks["Backend storage container"] = (
+                    environment.get("AZURE_STORAGE_CONTAINER_NAME", {}).get("value")
+                    == expected_storage_container
+                )
+                checks["Backend current blob"] = (
+                    environment.get("AZURE_STORAGE_CURRENT_BLOB", {}).get("value")
+                    == expected_current_blob
+                )
+                checks["Backend Managed Identity client ID"] = (
+                    environment.get("AZURE_CLIENT_ID", {}).get("value")
+                    == expected_backend_client_id
+                )
+                checks["Backend database URL absent in Blob mode"] = (
+                    "DATABASE_URL" not in environment
+                )
+            else:
+                database_url = environment.get("DATABASE_URL", {})
+                checks["Backend database secret reference"] = (
+                    database_url.get("secretRef") == "neon-database-url"
+                    and "value" not in database_url
+                )
             checks["Migration URL absent"] = (
                 "NEON_MIGRATION_DATABASE_URL" not in environment
             )
@@ -154,7 +182,10 @@ def fixture(kind: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     container_environment = (
         [{"name": "INTERNAL_API_URL", "value": "https://backend.internal"}]
         if external
-        else [{"name": "DATABASE_URL", "secretRef": "neon-database-url"}]
+        else [
+            {"name": "DATA_STORE", "value": "postgres"},
+            {"name": "DATABASE_URL", "secretRef": "neon-database-url"},
+        ]
     )
     app = {
         "name": name,
@@ -252,9 +283,27 @@ def self_test() -> None:
         lambda: validate_state(backend, wrong_image, **backend_expected),
         "revision digest mismatch",
     )
+    blob_backend = deepcopy(backend_revision)
+    blob_backend["properties"]["template"]["containers"][0]["env"] = [
+        {"name": "DATA_STORE", "value": "blob"},
+        {"name": "AZURE_STORAGE_ACCOUNT_NAME", "value": "kokuseiproddata"},
+        {"name": "AZURE_STORAGE_CONTAINER_NAME", "value": "official-data"},
+        {"name": "AZURE_STORAGE_CURRENT_BLOB", "value": "current.json"},
+        {"name": "AZURE_CLIENT_ID", "value": "backend-client-id"},
+    ]
+    validate_state(
+        backend,
+        blob_backend,
+        **backend_expected,
+        expected_data_store="blob",
+        expected_storage_account="kokuseiproddata",
+        expected_storage_container="official-data",
+        expected_current_blob="current.json",
+        expected_backend_client_id="backend-client-id",
+    )
     print(
         "Container App read-back validator self-test passed: normal Frontend/"
-        "Backend, Traffic 0%, Traffic total mismatch, Frontend internal, "
+        "Backend, Blob Backend, Traffic 0%, Traffic total mismatch, Frontend internal, "
         "Backend external, revision digest mismatch"
     )
 
@@ -281,6 +330,19 @@ def main() -> None:
             expected_image=required_environment("EXPECTED_IMAGE"),
             expected_registry=required_environment("EXPECTED_REGISTRY"),
             expected_identity=required_environment("EXPECTED_IDENTITY_ID"),
+            expected_data_store=os.environ.get("EXPECTED_DATA_STORE", "postgres"),
+            expected_storage_account=os.environ.get(
+                "EXPECTED_STORAGE_ACCOUNT", ""
+            ),
+            expected_storage_container=os.environ.get(
+                "EXPECTED_STORAGE_CONTAINER", ""
+            ),
+            expected_current_blob=os.environ.get(
+                "EXPECTED_CURRENT_BLOB", "current.json"
+            ),
+            expected_backend_client_id=os.environ.get(
+                "EXPECTED_BACKEND_CLIENT_ID", ""
+            ),
         )
         print("Container App read-back matches the immutable deployment inputs")
     except (StateError, AssertionError) as error:

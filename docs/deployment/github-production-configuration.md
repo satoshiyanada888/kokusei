@@ -44,8 +44,14 @@ Stage 2は`.github/workflows/prepare-production.yml`、Stage 3は`.github/workfl
 | `AZURE_CONTAINER_APP_BACKEND` | Backend app名 | `backend_container_app_name` output | Stage 1後 | guardで停止 |
 | `FRONTEND_IDENTITY_ID` | Frontend ACR pull identity resource ID | `frontend_identity_id` output | Stage 1後 | guardで停止 |
 | `BACKEND_IDENTITY_ID` | Backend ACR pull identity resource ID | `backend_identity_id` output | Stage 1後 | guardで停止 |
+| `BACKEND_IDENTITY_CLIENT_ID` | Blob SDKが選択するBackend Managed Identity | `backend_identity_client_id` output | Blob切替前 | Blob mode guardで停止 |
 | `APP_DATABASE_USER` | 非特権Backend role名 | Neonで作成済みrole | deploy前 | Migration guardで停止 |
 | `NEXT_PUBLIC_SITE_URL` | canonical/OGP/sitemap用HTTPS origin | `expected_frontend_url` output | Frontend初回build前 | guardで停止 |
+| `PRODUCTION_SNAPSHOT_UPLOAD` | Stage 2 Blob upload切替（既定`false`） | Storage apply/read-back後に人間が設定 | Blob Phase 2 | `true/false`以外はguardで停止 |
+| `PRODUCTION_DATA_STORE` | Backend repository切替（既定`postgres`） | Blob証跡確認後に人間が設定 | Blob Phase 2 | `postgres/blob`以外はguardで停止 |
+| `AZURE_STORAGE_ACCOUNT_NAME` | 公式snapshot用Storage Account | `app_data_storage_account_name` output | Blob Phase 2 | Blob mode guardで停止 |
+| `AZURE_STORAGE_CONTAINER_NAME` | private snapshot container | `app_data_storage_container_name` output | Blob Phase 2 | Blob mode guardで停止 |
+| `AZURE_STORAGE_CURRENT_BLOB` | atomic pointer blob | 固定値`current.json` | Blob Phase 2 | Blob mode guardで停止 |
 
 これらは識別子・公開originでありpasswordではないためVariableとする。ただし、値を推測せずStage 1 outputと対象Azure accountから転記する。
 
@@ -79,6 +85,10 @@ terraform output -raw frontend_container_app_name
 terraform output -raw backend_container_app_name
 terraform output -raw frontend_identity_id
 terraform output -raw backend_identity_id
+terraform output -raw backend_identity_client_id
+terraform output -raw app_data_storage_account_name
+terraform output -raw app_data_storage_container_name
+terraform output -raw app_data_storage_account_id
 terraform output -raw expected_frontend_url
 ```
 
@@ -96,6 +106,9 @@ terraform output -raw expected_frontend_url
 | `backend_container_app_name` | `AZURE_CONTAINER_APP_BACKEND` |
 | `frontend_identity_id` | `FRONTEND_IDENTITY_ID` |
 | `backend_identity_id` | `BACKEND_IDENTITY_ID` |
+| `backend_identity_client_id` | `BACKEND_IDENTITY_CLIENT_ID` |
+| `app_data_storage_account_name` | `AZURE_STORAGE_ACCOUNT_NAME` |
+| `app_data_storage_container_name` | `AZURE_STORAGE_CONTAINER_NAME` |
 | `expected_frontend_url` | `NEXT_PUBLIC_SITE_URL` |
 
 | Repository固定値 | 用途 | 機密性 |

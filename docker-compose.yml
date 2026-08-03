@@ -32,6 +32,19 @@ services:
       database:
         condition: service_healthy
 
+  backend-file:
+    profiles: ["file"]
+    build: ./backend
+    environment:
+      DATA_STORE: file
+      DATA_FILE_PATH: /data/dataset.json
+      PORT: "8080"
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-http://localhost:3000}
+    volumes:
+      - ./backend/testdata:/data:ro
+    ports:
+      - "127.0.0.1:18080:8080"
+
   frontend:
     build:
       context: ./frontend

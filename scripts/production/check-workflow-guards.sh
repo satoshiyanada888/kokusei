@@ -12,6 +12,7 @@ platform_verifier=scripts/production/verify-image-platform.sh
 acr_login_server_validator=scripts/production/validate-acr-login-server.sh
 stage2_evidence_validator=scripts/production/validate-stage2-evidence.py
 container_app_state_validator=scripts/production/verify-container-app-state.py
+snapshot_uploader=scripts/production/upload-blob-snapshot.sh
 frontend_config=frontend/next.config.ts
 frontend_middleware=frontend/middleware.ts
 
@@ -128,6 +129,12 @@ require 'matcher: "/_next/image"' "$frontend_middleware"
 
 require "PREPARE" "$stage2_workflow"
 require 'ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}' "$stage2_workflow"
+require 'PRODUCTION_SNAPSHOT_UPLOAD: ${{ vars.PRODUCTION_SNAPSHOT_UPLOAD || '\''false'\'' }}' "$stage2_workflow"
+require "Generate and validate the official JSON snapshot" "$stage2_workflow"
+require "Upload and read back the immutable Blob snapshot" "$stage2_workflow"
+require "scripts/production/upload-blob-snapshot.sh" "$stage2_workflow"
+require "/export-snapshot" "$stage2_workflow"
+require "--commit-sha \"\$GITHUB_SHA\"" "$stage2_workflow"
 require "AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER" "$stage2_workflow"
 require 'az acr login --name "$AZURE_CONTAINER_REGISTRY"' "$stage2_workflow"
 require 'registry="$(scripts/production/validate-acr-login-server.sh)"' "$stage2_workflow"
@@ -212,6 +219,15 @@ require "digest is not tagged with the requested commit SHA" "$stage3_workflow"
 require "scripts/production/verify-image-platform.sh" "$stage3_workflow"
 require "Create or update internal Backend" "$stage3_workflow"
 require 'external: false' "$stage3_workflow"
+require 'PRODUCTION_DATA_STORE: ${{ vars.PRODUCTION_DATA_STORE || '\''postgres'\'' }}' "$stage3_workflow"
+require 'case "$PRODUCTION_DATA_STORE" in' "$stage3_workflow"
+require '{name: "DATA_STORE", value: $data_store}' "$stage3_workflow"
+require '{name: "AZURE_STORAGE_ACCOUNT_NAME", value: $storage_account}' "$stage3_workflow"
+require '{name: "AZURE_STORAGE_CONTAINER_NAME", value: $storage_container}' "$stage3_workflow"
+require '{name: "AZURE_STORAGE_CURRENT_BLOB", value: $current_blob}' "$stage3_workflow"
+require '{name: "AZURE_CLIENT_ID", value: $backend_client_id}' "$stage3_workflow"
+require 'EXPECTED_DATA_STORE="$PRODUCTION_DATA_STORE"' "$stage3_workflow"
+require 'EXPECTED_BACKEND_CLIENT_ID="$BACKEND_IDENTITY_CLIENT_ID"' "$stage3_workflow"
 require "Create or update Frontend after Backend validation" "$stage3_workflow"
 require 'external: true' "$stage3_workflow"
 require 'path: "/health", port: 8080' "$stage3_workflow"
@@ -430,6 +446,21 @@ fi
 python3 "$stage2_evidence_validator" self-test >/dev/null
 python3 "$container_app_state_validator" --self-test >/dev/null
 
+require '--auth-mode login' "$snapshot_uploader"
+require 'snapshots/$GITHUB_SHA/dataset.json' "$snapshot_uploader"
+require 'Refusing to overwrite a different snapshot for the same commit SHA' "$snapshot_uploader"
+require 'Uploaded snapshot SHA-256 read-back mismatch' "$snapshot_uploader"
+require 'current.json is updated only after dataset upload and read-back validation succeed' "$snapshot_uploader"
+require 'SNAPSHOT_READ_BACK_SUCCEEDED=true' "$snapshot_uploader"
+if grep -E -- '--account-key|--sas-token|connection-string|AZURE_STORAGE_CONNECTION_STRING' "$stage2_workflow" "$stage3_workflow" "$snapshot_uploader" >/dev/null; then
+  echo "Blob snapshot workflows must not use a Storage Account key, SAS, or connection string" >&2
+  exit 1
+fi
+if grep -E 'https://[^ ]*[.]blob[.]core[.]windows[.]net' "$stage2_workflow" "$stage3_workflow" >/dev/null; then
+  echo "Frontend and workflow metadata must not expose direct Blob URLs" >&2
+  exit 1
+fi
+
 require "docker buildx imagetools inspect" "$platform_verifier"
 require "only linux/amd64 runtime platforms" "$platform_verifier"
 
@@ -501,8 +532,13 @@ fi
 
 manifest_line=$(grep -n -m1 'Resolve digests and verify linux/amd64 manifests' "$stage2_workflow" | cut -d: -f1)
 database_line=$(grep -n -m1 'Migrate Neon, import official data, and validate' "$stage2_workflow" | cut -d: -f1)
+snapshot_generate_line=$(grep -n -m1 'Generate and validate the official JSON snapshot' "$stage2_workflow" | cut -d: -f1)
+snapshot_upload_line=$(grep -n -m1 'Upload and read back the immutable Blob snapshot' "$stage2_workflow" | cut -d: -f1)
 metadata_line=$(grep -n -m1 'Write safe Stage 2 metadata' "$stage2_workflow" | cut -d: -f1)
 [ "$manifest_line" -lt "$database_line" ] || { echo "Manifest validation must precede database changes" >&2; exit 1; }
+[ "$database_line" -lt "$snapshot_generate_line" ] || { echo "Neon validation must precede snapshot generation in Phase 1" >&2; exit 1; }
+[ "$snapshot_generate_line" -lt "$snapshot_upload_line" ] || { echo "Snapshot validation must precede Blob upload" >&2; exit 1; }
+[ "$snapshot_upload_line" -lt "$metadata_line" ] || { echo "Blob read-back must precede Stage 2 metadata" >&2; exit 1; }
 [ "$database_line" -lt "$metadata_line" ] || { echo "Successful database validation must precede Stage 2 metadata" >&2; exit 1; }
 
 backend_line=$(grep -n -m1 'Create or update internal Backend' "$stage3_workflow" | cut -d: -f1)

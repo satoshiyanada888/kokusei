@@ -12,6 +12,37 @@ GitHub Actions ── TLS/direct → Migration・Importer・Validation
 
 Azure PostgreSQL Flexible Server、VNet、subnet、Private DNS、database password Terraform変数は現行構成から除外した。NeonはTerraform管理せず、接続URLはTerraform plan/stateへ渡さない。
 
+## Blob snapshot段階移行（Phase 1）
+
+Phase 1は現在のNeon公開を変更しない。コードとTerraformには、公式データ用の
+StorageV2 `Standard_LRS`、private Blob container、Backend identityの
+`Storage Blob Data Reader`、GitHub deploy identityの
+`Storage Blob Data Contributor`をcontainer scopeで定義する。Shared Access Key、
+SAS、connection stringは使用せず、Backendは`DefaultAzureCredential`、
+Stage 2はOIDC後の`az storage ... --auth-mode login`を使う。Storageのpublic
+network endpointはGitHub-hosted runner用に有効だが、container自体は公開しない。
+
+Snapshotは`dataset.json`にschema、UTC生成日時、commit SHA、3指標の最新値・時系列・
+単位・出典・公表/取得日時・更新履歴・注記を持ち、10進値を文字列のまま保持する。
+
+```text
+snapshots/<full-commit-sha>/dataset.json
+current.json
+```
+
+Stage 2はdataset upload後にdownloadしてSHA-256を照合し、全検証の最後にだけ
+`current.json`を更新して再読込する。同じcommitのblobが既にある場合は同一digest
+だけを再利用し、異なる内容で上書きしない。Backendは同じcommitをmemory cacheし、
+同時downloadを直列化する。一時的なBlob障害で正常cacheがあればそれを返し、初回load前
+の障害、schema/path/SHA不整合はエラーにする。
+
+Phase 1の`PRODUCTION_SNAPSHOT_UPLOAD`と`PRODUCTION_DATA_STORE`は既定で
+`false`と`postgres`である。Terraform apply、Environment Variable登録、Stage 2
+upload、Stage 3の`blob`切替を別承認するまでNeon経路を維持する。Rollbackは
+`PRODUCTION_DATA_STORE=postgres`へ戻してStage 3で新Revisionを作る。Blob切替後の
+API・画面・SEO Smoke、監視、rollback試験が成功し、fallback不要の判断を得るまで
+Neon ProjectとSecretを削除しない。
+
 ## Stage 1: Azure基盤
 
 Terraformが作るのはResource Group、ACR Basic、Log Analytics、Consumption Container Apps Environment、Frontend・Backend・GitHub OIDC用の3つのUser Assigned Identityと必要なrole assignmentだけ。Container App、Job、VNet、DBは作らず、サービスは公開されない。
@@ -90,8 +121,14 @@ Variables:
 - `AZURE_CONTAINER_APP_BACKEND`: `kokusei-prod-backend`
 - `FRONTEND_IDENTITY_ID`: Terraform `frontend_identity_id`
 - `BACKEND_IDENTITY_ID`: Terraform `backend_identity_id`
+- `BACKEND_IDENTITY_CLIENT_ID`: Terraform `backend_identity_client_id`（Blob credential選択）
 - `APP_DATABASE_USER`: Neon Backend role名
 - `NEXT_PUBLIC_SITE_URL`: 下記の初回FQDN
+- `PRODUCTION_SNAPSHOT_UPLOAD`: Phase 1既定`false`。Storage apply後だけ`true`
+- `PRODUCTION_DATA_STORE`: Phase 1既定`postgres`。Blob切替承認後だけ`blob`
+- `AZURE_STORAGE_ACCOUNT_NAME`: Terraform `app_data_storage_account_name`
+- `AZURE_STORAGE_CONTAINER_NAME`: Terraform `app_data_storage_container_name`
+- `AZURE_STORAGE_CURRENT_BLOB`: `current.json`
 
 OIDC identifiersはpasswordではないためVariablesとする。実値を推測して設定しない。
 

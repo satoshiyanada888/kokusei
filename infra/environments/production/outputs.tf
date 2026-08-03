@@ -55,6 +55,26 @@ output "backend_identity_id" {
   value       = azurerm_user_assigned_identity.backend.id
 }
 
+output "backend_identity_client_id" {
+  description = "Set as GitHub production Environment variable BACKEND_IDENTITY_CLIENT_ID for Blob DefaultAzureCredential."
+  value       = azurerm_user_assigned_identity.backend.client_id
+}
+
+output "app_data_storage_account_name" {
+  description = "Set as GitHub production Environment variable AZURE_STORAGE_ACCOUNT_NAME."
+  value       = azurerm_storage_account.app_data.name
+}
+
+output "app_data_storage_container_name" {
+  description = "Set as GitHub production Environment variable AZURE_STORAGE_CONTAINER_NAME."
+  value       = azurerm_storage_container.app_data.name
+}
+
+output "app_data_storage_account_id" {
+  description = "Resource ID of the private application data Storage Account."
+  value       = azurerm_storage_account.app_data.id
+}
+
 output "stage_1_scope" {
   description = "Stage 1 creates Azure foundation only; Neon and Container Apps are not created."
   value       = "azure-foundation-only"

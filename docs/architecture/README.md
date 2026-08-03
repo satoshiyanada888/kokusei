@@ -6,7 +6,9 @@
 
 KOKUSEIは、Next.js Frontend、Go Backend、PostgreSQL Databaseからなる
 モノレポである。ローカル開発はDocker Compose、本番公開は
-Azure Container AppsとNeon PostgreSQLを使用する。
+Azure Container AppsとNeon PostgreSQLを使用する。Phase 1では、同じAPI契約を
+Azure Blob Storageの公式JSON snapshotから提供できるRepositoryも実装済みだが、
+Productionの既定は引き続きNeonである。
 
 ```text
 Browser
@@ -21,6 +23,11 @@ Go REST API
 PostgreSQL
 ```
 
+Backendの永続化先は`DATA_STORE=postgres|blob|file`で選択する。`blob`は
+Managed Identityでprivate containerの`current.json`を読み、そこから
+commit SHA固定の`dataset.json`を取得する。`file`は同じschemaをAzureなしで
+検証するためのローカル実装である。
+
 詳しい設計原則は、既存の[Architecture概要](../architecture.md)を参照する。
 
 ## データフロー
@@ -31,6 +38,11 @@ PostgreSQL
 4. FrontendがAPIを取得し、一覧、詳細、グラフ、更新履歴として表示する。
 
 外部取得失敗時は既存データを維持し、開発用データと公式データを区別する。
+
+Blob snapshot経路ではStage 2が3つのProviderから正規化済み公式値を取得し、
+全検証後に`dataset.json`をupload・read-backする。最後に`current.json`を更新する
+ため、Backendが部分uploadを読むことはない。Backendは同じcommitをmemory cache
+から返し、一時的なBlob取得失敗では直前の正常cacheを維持する。
 
 ## コンポーネント
 
@@ -58,6 +70,8 @@ APIの既存レスポンス形式は後方互換性を維持し、統計値は�
   Log Analytics、Managed Identity、OIDC/RBAC
 - 本番Stage 2: immutable image build/push、Neon Migration、公式データImportとValidation
 - 本番Stage 3: digest固定のContainer Apps作成、read-back、Smoke Test、HTTPS公開
+- Blob Phase 1: app-data専用StorageV2、private container、Backend Readerと
+  GitHub deploy Contributorのcontainer限定RBAC。Terraform applyとProduction切替は未実施
 
 本番運用の詳細は
 [Azure Container Apps + Neon 初回公開手順](../deployment/azure-container-apps.md)

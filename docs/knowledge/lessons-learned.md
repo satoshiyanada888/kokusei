@@ -15,3 +15,15 @@
 対応:
 
 今後:
+
+## 2026-07-31
+
+### Immutable snapshotの公開順序
+
+問題: 大きなJSONを同じblob名へ直接上書きすると、検証前または部分更新の内容を読ませる可能性がある。
+
+原因: データ本体と「現在有効な版」の切替を同じwriteで扱うため。
+
+対応: commit SHA固定のdatasetを先にupload・read-backし、SHA-256検証後に小さな`current.json`だけを更新する。
+
+今後: snapshot型の配布ではimmutable bodyとmutable pointerを分離し、pointer更新を最後の操作にする。

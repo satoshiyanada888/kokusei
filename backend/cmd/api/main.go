@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -10,25 +11,24 @@ import (
 	"time"
 
 	"github.com/kokusei/dashboard/backend/internal/database"
+	"github.com/kokusei/dashboard/backend/internal/domain"
 	"github.com/kokusei/dashboard/backend/internal/handler"
 	"github.com/kokusei/dashboard/backend/internal/repository/postgres"
+	snapshotrepository "github.com/kokusei/dashboard/backend/internal/repository/snapshot"
 	"github.com/kokusei/dashboard/backend/internal/service"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	db, err := database.NewPool(ctx, required("DATABASE_URL"))
+
+	indicatorRepository, updateRepository, closeDataStore, err := repositories(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
-	if err := pingDatabase(ctx, db); err != nil {
-		log.Fatal(err)
-	}
-
-	indicators := service.NewIndicatorService(postgres.NewIndicatorRepository(db))
-	updates := service.NewUpdateService(postgres.NewUpdateHistoryRepository(db))
+	defer closeDataStore()
+	indicators := service.NewIndicatorService(indicatorRepository)
+	updates := service.NewUpdateService(updateRepository)
 	server := &http.Server{
 		Addr: ":" + env("PORT", "8080"), Handler: handler.New(indicators, updates).Routes(os.Getenv("ALLOWED_ORIGIN")),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -42,6 +42,43 @@ func main() {
 	log.Printf("API listening on %s", server.Addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
+	}
+}
+
+func repositories(ctx context.Context) (domain.IndicatorRepository, domain.UpdateHistoryRepository, func(), error) {
+	switch env("DATA_STORE", "postgres") {
+	case "postgres":
+		databaseURL := os.Getenv("DATABASE_URL")
+		if databaseURL == "" {
+			return nil, nil, func() {}, errors.New("DATABASE_URL is required for DATA_STORE=postgres")
+		}
+		db, err := database.NewPool(ctx, databaseURL)
+		if err != nil {
+			return nil, nil, func() {}, err
+		}
+		if err := pingDatabase(ctx, db); err != nil {
+			db.Close()
+			return nil, nil, func() {}, err
+		}
+		return postgres.NewIndicatorRepository(db), postgres.NewUpdateHistoryRepository(db), db.Close, nil
+	case "file":
+		path := os.Getenv("DATA_FILE_PATH")
+		if path == "" {
+			return nil, nil, func() {}, errors.New("DATA_FILE_PATH is required for DATA_STORE=file")
+		}
+		repository := snapshotrepository.NewFile(path)
+		return repository, snapshotrepository.NewUpdateRepository(repository), func() {}, nil
+	case "blob":
+		account := os.Getenv("AZURE_STORAGE_ACCOUNT_NAME")
+		container := os.Getenv("AZURE_STORAGE_CONTAINER_NAME")
+		source, err := snapshotrepository.NewBlobSource(account, container)
+		if err != nil {
+			return nil, nil, func() {}, err
+		}
+		repository := snapshotrepository.New(source, env("AZURE_STORAGE_CURRENT_BLOB", "current.json"))
+		return repository, snapshotrepository.NewUpdateRepository(repository), func() {}, nil
+	default:
+		return nil, nil, func() {}, errors.New("DATA_STORE must be postgres, blob, or file")
 	}
 }
 
