@@ -56,6 +56,24 @@ func TestRepositoryLoadsManifestCachesDatasetAndKeepsStaleGoodData(t *testing.T)
 	}
 }
 
+func TestRepositoryReturnsEmptyUpdateArrayInsteadOfNull(t *testing.T) {
+	source, _ := validSource(t, "a")
+	updates, err := New(source, "current.json").ListUpdates(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updates == nil || len(updates) != 0 {
+		t.Fatalf("updates=%#v", updates)
+	}
+	encoded, err := json.Marshal(updates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != "[]" {
+		t.Fatalf("encoded updates=%s", encoded)
+	}
+}
+
 func TestRepositoryRefreshAndIntegrityFailures(t *testing.T) {
 	source, _ := validSource(t, "a")
 	repository := New(source, "current.json")

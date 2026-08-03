@@ -39,3 +39,13 @@
 対応: Azure Resource IDだけをcase-insensitiveに正規化して比較し、表記差を許可しながら別Resource IDは拒否する回帰テストを追加した。
 
 今後: Azure Resource IDの一致確認では大小文字を意味のある差として扱わず、正規化後の完全一致を使用する。
+
+### 空の一覧APIとGoのnil slice
+
+問題: Blob snapshotへ切り替えた本番で、更新履歴が0件のときAPIが`null`を返し、配列を前提とするFrontendが500になった。
+
+原因: Goのnil sliceはJSONで`null`、非nilの空sliceは`[]`へencodeされる。PostgreSQL repositoryは空sliceを返していたが、snapshot repositoryだけがnil sliceを返していた。
+
+対応: 一覧repositoryはデータ0件でも非nilの空sliceを返し、JSON表現が`[]`になる回帰テストを追加した。
+
+今後: 永続化実装を追加するときは、値だけでなく空一覧、not found、errorのAPI表現も既存実装と比較する。

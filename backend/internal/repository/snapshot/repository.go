@@ -96,7 +96,7 @@ func (r *Repository) ListUpdates(ctx context.Context) ([]domain.UpdateHistory, e
 	if err != nil {
 		return nil, err
 	}
-	return append([]domain.UpdateHistory(nil), dataset.Updates...), nil
+	return append([]domain.UpdateHistory{}, dataset.Updates...), nil
 }
 
 type UpdateRepository struct{ snapshot *Repository }
