@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -97,6 +98,7 @@ def validate_run_and_artifact(
 
 
 def validate_metadata(metadata: dict[str, Any], expected: dict[str, Any]) -> None:
+    blob = metadata.get("blob_snapshot", {})
     checks = {
         "commit SHA": metadata.get("commit_sha") == expected["commit"],
         "Frontend digest": metadata.get("frontend", {}).get("digest")
@@ -113,14 +115,14 @@ def validate_metadata(metadata: dict[str, Any], expected: dict[str, Any]) -> Non
             metadata.get("backend", {}).get("architecture"),
         )
         == ("linux", "amd64"),
-        "Migration": metadata.get("migration") == "succeeded",
-        "births import": metadata.get("official_data_import", {}).get("births")
+        "snapshot generation": metadata.get("snapshot_generation") == "succeeded",
+        "births fetch": metadata.get("official_data_fetch", {}).get("births")
         == "succeeded",
-        "unemployment import": metadata.get("official_data_import", {}).get(
+        "unemployment fetch": metadata.get("official_data_fetch", {}).get(
             "unemployment_rate"
         )
         == "succeeded",
-        "population import": metadata.get("official_data_import", {}).get(
+        "population fetch": metadata.get("official_data_fetch", {}).get(
             "population"
         )
         == "succeeded",
@@ -134,6 +136,19 @@ def validate_metadata(metadata: dict[str, Any], expected: dict[str, Any]) -> Non
         == "succeeded",
         "cross-indicator validation": metadata.get("validation", {}).get("all")
         == "succeeded",
+        "Blob snapshot enabled": blob.get("enabled") is True,
+        "Blob snapshot upload": blob.get("uploadSucceeded") is True,
+        "Blob snapshot read-back": blob.get("readBackSucceeded") is True,
+        "Blob snapshot source commit": blob.get("sourceCommitSha")
+        == expected["commit"],
+        "Blob snapshot path": blob.get("snapshotBlobName")
+        == f"snapshots/{expected['commit']}/dataset.json",
+        "Blob current pointer": blob.get("currentBlobName") == "current.json",
+        "Blob dataset digest": isinstance(blob.get("datasetSha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", blob["datasetSha256"]) is not None,
+        "Blob dataset size": isinstance(blob.get("datasetSize"), int)
+        and blob["datasetSize"] > 0,
+        "Blob schema version": blob.get("schemaVersion") == 1,
     }
     for label, valid in checks.items():
         if not valid:
@@ -187,8 +202,8 @@ def self_test() -> None:
             "os": "linux",
             "architecture": "amd64",
         },
-        "migration": "succeeded",
-        "official_data_import": {
+        "snapshot_generation": "succeeded",
+        "official_data_fetch": {
             "births": "succeeded",
             "unemployment_rate": "succeeded",
             "population": "succeeded",
@@ -198,6 +213,17 @@ def self_test() -> None:
             "unemployment_rate": "succeeded",
             "population": "succeeded",
             "all": "succeeded",
+        },
+        "blob_snapshot": {
+            "enabled": True,
+            "uploadSucceeded": True,
+            "readBackSucceeded": True,
+            "sourceCommitSha": expected["commit"],
+            "snapshotBlobName": f"snapshots/{expected['commit']}/dataset.json",
+            "currentBlobName": "current.json",
+            "datasetSha256": "d" * 64,
+            "datasetSize": 1024,
+            "schemaVersion": 1,
         },
     }
 
@@ -302,10 +328,22 @@ def self_test() -> None:
     expect_failure(
         lambda: validate_metadata(wrong_platform, expected), "platform mismatch"
     )
+    failed_blob_readback = deepcopy(metadata)
+    failed_blob_readback["blob_snapshot"]["readBackSucceeded"] = False
+    expect_failure(
+        lambda: validate_metadata(failed_blob_readback, expected),
+        "Blob read-back failure",
+    )
+    wrong_blob_path = deepcopy(metadata)
+    wrong_blob_path["blob_snapshot"]["snapshotBlobName"] = "dataset.json"
+    expect_failure(
+        lambda: validate_metadata(wrong_blob_path, expected), "Blob path mismatch"
+    )
     print(
         "Stage 2 evidence validator self-test passed: normal, invalid run ID, "
         "failure run, attempt 2, run/artifact SHA mismatch, artifact "
-        "missing/duplicate/wrong-owner/expired, digest mismatch, platform mismatch"
+        "missing/duplicate/wrong-owner/expired, digest/platform mismatch, "
+        "Blob read-back/path mismatch"
     )
 
 

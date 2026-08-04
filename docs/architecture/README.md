@@ -7,8 +7,8 @@
 KOKUSEIは、Next.js Frontend、Go Backend、複数のrepository実装からなる
 モノレポである。ローカル開発はDocker ComposeとPostgreSQLを使用する。本番公開は
 Azure Container Apps上のBackendが、Managed IdentityでprivateなAzure Blob
-Storageから公式JSON snapshotを読み込む。Neon PostgreSQLはStage 2の公式データ
-Import・検証とsnapshot生成に使用し、公開Backendのデータ参照先にはしない。
+Storageから公式JSON snapshotを読み込む。Stage 2もNeon PostgreSQLを使用せず、
+公的機関のProviderと直前の検証済みBlob snapshotから次のsnapshotを生成する。
 
 ```text
 Browser
@@ -25,7 +25,7 @@ Azure Blob Storage (private JSON snapshot)
 Stage 2 data pipeline
   |
   +-- Official data providers
-  +-- Neon PostgreSQL migration / import / validation
+  +-- Previous Blob snapshot verification / revision comparison
   +-- Immutable JSON snapshot
   +-- Azure Blob Storage upload and current.json switch
 ```
@@ -40,8 +40,8 @@ commit SHA固定の`dataset.json`を取得する。`file`は同じschemaをAzure
 ## データフロー
 
 1. Stage 2で外部データProviderが公的機関の一次情報を取得する。
-2. Neon PostgreSQLへImportし、指標別・横断Validationを行う。
-3. 検証済みデータからimmutableな`dataset.json`を生成してBlobへupload・read-backする。
+2. `current.json`が指す直前のsnapshotをSHA-256付きで検証し、同一期間の値変更だけを更新履歴へ追加する。新規期間は改訂として扱わない。
+3. 公式値、schema、出典、更新履歴を検証したimmutableな`dataset.json`をBlobへupload・read-backする。
 4. 最後に`current.json`を切り替え、本番Backendが新しいsnapshotを参照する。
 5. BackendがREST APIから10進文字列として統計値を返す。
 6. FrontendがAPIを取得し、一覧、詳細、グラフ、更新履歴として表示する。
@@ -78,7 +78,7 @@ APIの既存レスポンス形式は後方互換性を維持し、統計値は�
 - ローカル: Docker ComposeによるFrontend、Backend、PostgreSQL
 - 本番Stage 1: Azure Container Registry、Container Apps Environment、
   Log Analytics、Managed Identity、OIDC/RBAC
-- 本番Stage 2: immutable image build/push、Neon Migration、公式データImportとValidation、
+- 本番Stage 2: immutable image build/push、公式Provider取得、直前snapshotとの差分履歴生成、
   JSON snapshotのBlob upload・read-back・`current.json`切替
 - 本番Stage 3: digest固定のContainer Apps作成、read-back、Smoke Test、HTTPS公開
 - 本番データ参照: app-data専用StorageV2、private container、Backend Readerと

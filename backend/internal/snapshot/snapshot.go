@@ -245,7 +245,15 @@ func Validate(dataset Dataset) error {
 			}
 		}
 	}
+	updateIDs := make(map[int64]struct{}, len(dataset.Updates))
 	for _, update := range dataset.Updates {
+		if update.ID <= 0 {
+			return fmt.Errorf("snapshot update history for %q has invalid ID", update.IndicatorSlug)
+		}
+		if _, duplicate := updateIDs[update.ID]; duplicate {
+			return fmt.Errorf("snapshot update history has duplicate ID %d", update.ID)
+		}
+		updateIDs[update.ID] = struct{}{}
 		if _, ok := definitions[update.IndicatorSlug]; !ok || update.IndicatorName == "" ||
 			update.Unit == "" || update.CurrentValue == "" || !numericPattern.MatchString(update.CurrentValue) ||
 			update.Period == "" || update.DetectedAt.IsZero() || update.SourceName == "" ||
@@ -257,6 +265,91 @@ func Validate(dataset Dataset) error {
 		}
 	}
 	return nil
+}
+
+// MergeRevisionHistory carries forward verified history from the previous
+// snapshot and records only same-period value revisions. A newly published
+// period is not a revision. Missing prior periods fail closed so a partial
+// provider response cannot silently erase published official data.
+func MergeRevisionHistory(current Dataset, previous *Dataset) (Dataset, error) {
+	if err := Validate(current); err != nil {
+		return Dataset{}, fmt.Errorf("validate current snapshot: %w", err)
+	}
+	if previous == nil {
+		return current, nil
+	}
+	if err := Validate(*previous); err != nil {
+		return Dataset{}, fmt.Errorf("validate previous snapshot: %w", err)
+	}
+
+	currentBySlug := make(map[string]domain.Indicator, len(current.Indicators))
+	for _, indicator := range current.Indicators {
+		currentBySlug[indicator.Slug] = indicator
+	}
+	updates := append([]domain.UpdateHistory{}, previous.Updates...)
+	var maxID int64
+	for _, update := range updates {
+		if update.ID > maxID {
+			maxID = update.ID
+		}
+	}
+
+	for _, previousIndicator := range previous.Indicators {
+		currentIndicator, ok := currentBySlug[previousIndicator.Slug]
+		if !ok {
+			return Dataset{}, fmt.Errorf("current snapshot is missing indicator %q", previousIndicator.Slug)
+		}
+		currentValues := make(map[string]domain.Value, len(currentIndicator.Series))
+		for _, value := range currentIndicator.Series {
+			currentValues[value.Period] = value
+		}
+		for _, previousValue := range previousIndicator.Series {
+			currentValue, exists := currentValues[previousValue.Period]
+			if !exists {
+				return Dataset{}, fmt.Errorf("current snapshot indicator %q is missing previously published period %q", previousIndicator.Slug, previousValue.Period)
+			}
+			equal, err := decimalsEqual(previousValue.Value, currentValue.Value)
+			if err != nil {
+				return Dataset{}, fmt.Errorf("compare indicator %q period %q: %w", previousIndicator.Slug, previousValue.Period, err)
+			}
+			if equal {
+				continue
+			}
+			maxID++
+			oldValue := previousValue.Value
+			updates = append(updates, domain.UpdateHistory{
+				ID: maxID, IndicatorSlug: currentIndicator.Slug, IndicatorName: currentIndicator.Name,
+				Unit: currentIndicator.Unit, PreviousValue: &oldValue, CurrentValue: currentValue.Value,
+				Period: currentValue.Period, DetectedAt: current.GeneratedAt,
+				SourceName: currentIndicator.SourceName, SourceURL: currentValue.SourceURL, Development: false,
+			})
+		}
+	}
+
+	sort.SliceStable(updates, func(i, j int) bool {
+		if !updates[i].DetectedAt.Equal(updates[j].DetectedAt) {
+			return updates[i].DetectedAt.After(updates[j].DetectedAt)
+		}
+		return updates[i].ID > updates[j].ID
+	})
+	current.Updates = updates
+	current.Notes = []string{"Official normalized source values; revision history is derived from verified snapshot-to-snapshot comparisons."}
+	if err := Validate(current); err != nil {
+		return Dataset{}, fmt.Errorf("validate merged snapshot: %w", err)
+	}
+	return current, nil
+}
+
+func decimalsEqual(left, right string) (bool, error) {
+	leftRat, ok := new(big.Rat).SetString(left)
+	if !ok {
+		return false, errors.New("invalid left decimal")
+	}
+	rightRat, ok := new(big.Rat).SetString(right)
+	if !ok {
+		return false, errors.New("invalid right decimal")
+	}
+	return leftRat.Cmp(rightRat) == 0, nil
 }
 
 func Marshal(dataset Dataset) ([]byte, error) {

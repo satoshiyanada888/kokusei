@@ -148,7 +148,7 @@ jobs:
       BACKEND_IDENTITY_ID: ${{ vars.BACKEND_IDENTITY_ID }}
       BACKEND_IDENTITY_CLIENT_ID: ${{ vars.BACKEND_IDENTITY_CLIENT_ID }}
       NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
-      PRODUCTION_DATA_STORE: ${{ vars.PRODUCTION_DATA_STORE || 'postgres' }}
+      PRODUCTION_DATA_STORE: ${{ vars.PRODUCTION_DATA_STORE || 'blob' }}
       AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.AZURE_STORAGE_ACCOUNT_NAME }}
       AZURE_STORAGE_CONTAINER_NAME: ${{ vars.AZURE_STORAGE_CONTAINER_NAME }}
       AZURE_STORAGE_CURRENT_BLOB: ${{ vars.AZURE_STORAGE_CURRENT_BLOB || 'current.json' }}
@@ -157,30 +157,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Fail closed unless Stage 3 prerequisites are explicit
-        env:
-          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          NEON_URL_VALIDATION_MODE: backend
         shell: bash
         run: |
           set -euo pipefail
-          required=(TARGET_COMMIT FRONTEND_DIGEST BACKEND_DIGEST AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID NEXT_PUBLIC_SITE_URL PRODUCTION_DATA_STORE NEON_DATABASE_URL)
+          required=(TARGET_COMMIT FRONTEND_DIGEST BACKEND_DIGEST AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_RESOURCE_GROUP AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER AZURE_CONTAINER_APP_ENVIRONMENT AZURE_CONTAINER_APP_FRONTEND AZURE_CONTAINER_APP_BACKEND FRONTEND_IDENTITY_ID BACKEND_IDENTITY_ID BACKEND_IDENTITY_CLIENT_ID NEXT_PUBLIC_SITE_URL PRODUCTION_DATA_STORE AZURE_STORAGE_ACCOUNT_NAME AZURE_STORAGE_CONTAINER_NAME AZURE_STORAGE_CURRENT_BLOB)
           for name in "${required[@]}"; do
             [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
           done
           case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
           scripts/production/validate-acr-login-server.sh >/dev/null
-          case "$PRODUCTION_DATA_STORE" in
-            postgres)
-              scripts/production/validate-neon-urls.py
-              ;;
-            blob)
-              required_blob=(BACKEND_IDENTITY_CLIENT_ID AZURE_STORAGE_ACCOUNT_NAME AZURE_STORAGE_CONTAINER_NAME AZURE_STORAGE_CURRENT_BLOB)
-              for name in "${required_blob[@]}"; do
-                [ -n "${!name:-}" ] || { echo "Required Blob data setting is missing: $name"; exit 1; }
-              done
-              ;;
-            *) echo "PRODUCTION_DATA_STORE must be postgres or blob"; exit 1 ;;
-          esac
+          [ "$PRODUCTION_DATA_STORE" = "blob" ] || {
+            echo "PRODUCTION_DATA_STORE must be blob for production Stage 3"
+            exit 1
+          }
 
       - name: Verify GitHub OIDC claims
         env:
@@ -261,8 +250,6 @@ jobs:
           }
 
       - name: Create or update internal Backend
-        env:
-          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
         shell: bash
         run: |
           set -euo pipefail
@@ -293,7 +280,7 @@ jobs:
                   activeRevisionsMode: "Multiple",
                   ingress: {external: false, targetPort: 8080, transport: "auto", allowInsecure: false},
                   registries: [{server: $registry, identity: $identity_id}],
-                  secrets: [{name: "neon-database-url", value: env.NEON_DATABASE_URL}]
+                  secrets: []
                 },
                 template: {
                   revisionSuffix: $revision,
@@ -301,21 +288,14 @@ jobs:
                     name: "backend",
                     image: $image,
                     resources: {cpu: 0.25, memory: "0.5Gi"},
-                    env: (
-                      [
-                        {name: "DATA_STORE", value: $data_store},
-                        {name: "PORT", value: "8080"}
-                      ]
-                      + if $data_store == "blob" then [
-                          {name: "AZURE_STORAGE_ACCOUNT_NAME", value: $storage_account},
-                          {name: "AZURE_STORAGE_CONTAINER_NAME", value: $storage_container},
-                          {name: "AZURE_STORAGE_CURRENT_BLOB", value: $current_blob},
-                          {name: "AZURE_CLIENT_ID", value: $backend_client_id}
-                        ] else [
-                          {name: "DATABASE_URL", secretRef: "neon-database-url"},
-                          {name: "DATABASE_POOL_MAX_CONNS", value: "5"}
-                        ] end
-                    ),
+                    env: [
+                      {name: "DATA_STORE", value: $data_store},
+                      {name: "PORT", value: "8080"},
+                      {name: "AZURE_STORAGE_ACCOUNT_NAME", value: $storage_account},
+                      {name: "AZURE_STORAGE_CONTAINER_NAME", value: $storage_container},
+                      {name: "AZURE_STORAGE_CURRENT_BLOB", value: $current_blob},
+                      {name: "AZURE_CLIENT_ID", value: $backend_client_id}
+                    ],
                     probes: [
                       {type: "Startup", httpGet: {path: "/health", port: 8080}, initialDelaySeconds: 5, periodSeconds: 5, failureThreshold: 10},
                       {type: "Liveness", httpGet: {path: "/health", port: 8080}, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 3},
@@ -328,7 +308,7 @@ jobs:
             }' > "$specification"
           chmod 0600 "$specification"
 
-          # /health is intentionally process-only and does not verify the Neon connection.
+          # /health is intentionally process-only; API smoke tests verify Blob snapshot access.
           if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" --output none 2>/dev/null; then
             az containerapp update -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_BACKEND" \
               --yaml "$specification" --only-show-errors --output none

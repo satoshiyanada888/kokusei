@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       confirmation:
-        description: "Type PREPARE to build images and prepare the production database"
+        description: "Type PREPARE to build images and publish a verified production snapshot"
         required: true
         type: string
 
@@ -104,7 +104,6 @@ jobs:
       AZURE_FEDERATED_SUBJECT: ${{ vars.AZURE_FEDERATED_SUBJECT }}
       AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY }}
       ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
-      APP_DATABASE_USER: ${{ vars.APP_DATABASE_USER }}
       NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
       PRODUCTION_SNAPSHOT_UPLOAD: ${{ vars.PRODUCTION_SNAPSHOT_UPLOAD || 'false' }}
       AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.AZURE_STORAGE_ACCOUNT_NAME }}
@@ -116,33 +115,24 @@ jobs:
 
       - name: Fail closed unless Stage 2 prerequisites are explicit
         env:
-          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          NEON_MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
           ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
         shell: bash
         run: |
           set -euo pipefail
-          required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER APP_DATABASE_USER NEXT_PUBLIC_SITE_URL NEON_DATABASE_URL NEON_MIGRATION_DATABASE_URL ESTAT_APP_ID)
+          required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_FEDERATED_SUBJECT AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER NEXT_PUBLIC_SITE_URL ESTAT_APP_ID AZURE_STORAGE_ACCOUNT_NAME AZURE_STORAGE_CONTAINER_NAME AZURE_STORAGE_CURRENT_BLOB)
           for name in "${required[@]}"; do
             [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
           done
           case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "GITHUB_SHA must be a full commit SHA"; exit 1; }
           scripts/production/validate-acr-login-server.sh >/dev/null
-          scripts/production/validate-neon-urls.py
-          case "$PRODUCTION_SNAPSHOT_UPLOAD" in
-            true)
-              required_blob=(AZURE_STORAGE_ACCOUNT_NAME AZURE_STORAGE_CONTAINER_NAME AZURE_STORAGE_CURRENT_BLOB)
-              for name in "${required_blob[@]}"; do
-                [ -n "${!name:-}" ] || { echo "Required Blob snapshot setting is missing: $name"; exit 1; }
-              done
-              ;;
-            false) ;;
-            *) echo "PRODUCTION_SNAPSHOT_UPLOAD must be true or false"; exit 1 ;;
-          esac
+          [ "$PRODUCTION_SNAPSHOT_UPLOAD" = "true" ] || {
+            echo "PRODUCTION_SNAPSHOT_UPLOAD must be true for production Stage 2"
+            exit 1
+          }
           echo "Stage 2 target commit: $GITHUB_SHA"
 
-      - name: Build linux/amd64 application and migration images
+      - name: Build linux/amd64 application images
         shell: bash
         run: |
           set -euo pipefail
@@ -151,8 +141,6 @@ jobs:
             -t "kokusei-frontend:$GITHUB_SHA" frontend
           docker buildx build --platform linux/amd64 --load \
             -t "kokusei-backend:$GITHUB_SHA" backend
-          docker buildx build --platform linux/amd64 --load \
-            -t "kokusei-migration:$GITHUB_SHA" database
 
       - name: Verify GitHub OIDC claims
         env:
@@ -211,7 +199,6 @@ jobs:
             echo "REGISTRY=$registry"
             echo "FRONTEND_IMAGE=$frontend_image"
             echo "BACKEND_IMAGE=$backend_image"
-            echo "MIGRATION_IMAGE=kokusei-migration:$GITHUB_SHA"
           } >> "$GITHUB_ENV"
 
       - name: Resolve digests and verify linux/amd64 manifests
@@ -245,47 +232,64 @@ jobs:
             echo "BACKEND_OS=linux"
           } >> "$GITHUB_ENV"
 
-      - name: Migrate Neon, import official data, and validate
+      - name: Download and verify the currently published Blob snapshot
         shell: bash
-        env:
-          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          NEON_MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
-          ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
-        run: scripts/production/run-stage2.sh
+        run: scripts/production/download-current-blob-snapshot.sh
 
       - name: Generate and validate the official JSON snapshot
-        if: env.PRODUCTION_SNAPSHOT_UPLOAD == 'true'
         env:
           ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
-          DATABASE_URL: ${{ secrets.NEON_MIGRATION_DATABASE_URL }}
         shell: bash
         run: |
           set -euo pipefail
           snapshot_directory="$(mktemp -d "$RUNNER_TEMP/kokusei-snapshot.XXXXXX")"
           chmod 0700 "$snapshot_directory"
           snapshot="$snapshot_directory/dataset.json"
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --entrypoint /export-snapshot \
-            --env ESTAT_APP_ID \
-            --env DATABASE_URL \
-            --volume "$snapshot_directory:/snapshot" \
-            "kokusei-backend:$GITHUB_SHA" \
-            --output /snapshot/dataset.json \
-            --commit-sha "$GITHUB_SHA"
+          if [ "$PREVIOUS_SNAPSHOT_PRESENT" = "true" ]; then
+            docker run --rm \
+              --user "$(id -u):$(id -g)" \
+              --entrypoint /export-snapshot \
+              --env ESTAT_APP_ID \
+              --volume "$snapshot_directory:/snapshot" \
+              --volume "$PREVIOUS_SNAPSHOT_DIRECTORY:/previous:ro" \
+              "kokusei-backend:$GITHUB_SHA" \
+              --output /snapshot/dataset.json \
+              --previous /previous/dataset.json \
+              --commit-sha "$GITHUB_SHA"
+          else
+            docker run --rm \
+              --user "$(id -u):$(id -g)" \
+              --entrypoint /export-snapshot \
+              --env ESTAT_APP_ID \
+              --volume "$snapshot_directory:/snapshot" \
+              "kokusei-backend:$GITHUB_SHA" \
+              --output /snapshot/dataset.json \
+              --commit-sha "$GITHUB_SHA"
+          fi
           chmod 0600 "$snapshot"
           jq -e '
             .schemaVersion == 1
             and .sourceCommitSha == env.GITHUB_SHA
             and (.indicators | length == 3)
             and ([.indicators[].slug] | sort == ["births", "population", "unemployment-rate"])
-            and all(.indicators[]; (.series | length) > 0 and (.latest.value | type == "string"))
+            and all(.indicators[];
+              (.series | length) > 0
+              and (.latest.value | type == "string")
+              and (.sourceUrl | startswith("https://"))
+              and all(.series[]; (.value | type == "string") and (.sourceUrl | startswith("https://")))
+            )
+            and (.updates | type == "array")
+            and all(.updates[];
+              (.id | type == "number" and . > 0)
+              and (.currentValue | type == "string")
+              and (.sourceUrl | startswith("https://"))
+              and (.developmentData == false)
+            )
           ' "$snapshot" >/dev/null
           echo "SNAPSHOT_DATASET=$snapshot" >> "$GITHUB_ENV"
           echo "SNAPSHOT_DIRECTORY=$snapshot_directory" >> "$GITHUB_ENV"
 
       - name: Upload and read back the immutable Blob snapshot
-        if: env.PRODUCTION_SNAPSHOT_UPLOAD == 'true'
         shell: bash
         run: scripts/production/upload-blob-snapshot.sh
 
@@ -320,8 +324,8 @@ jobs:
               commit_sha: $commit,
               frontend: {image_uri: $frontend_image, digest: $frontend_digest, architecture: $frontend_arch, os: $frontend_os},
               backend: {image_uri: $backend_image, digest: $backend_digest, architecture: $backend_arch, os: $backend_os},
-              migration: "succeeded",
-              official_data_import: {births: "succeeded", unemployment_rate: "succeeded", population: "succeeded"},
+              snapshot_generation: "succeeded",
+              official_data_fetch: {births: "succeeded", unemployment_rate: "succeeded", population: "succeeded"},
               validation: {births: "succeeded", unemployment_rate: "succeeded", population: "succeeded", all: "succeeded"},
               blob_snapshot: {
                 enabled: ($snapshot_enabled == "true"),
@@ -351,9 +355,9 @@ jobs:
             echo "- Backend image: \`$BACKEND_IMAGE\`"
             echo "- Backend digest: \`$BACKEND_DIGEST\`"
             echo "- Backend platform: \`$BACKEND_OS/$BACKEND_ARCH\`"
-            echo "- Migration: succeeded"
-            echo "- Official data import: births, unemployment-rate, and population succeeded"
-            echo "- Validation: births, unemployment-rate, population, and cross-indicator checks succeeded"
+            echo "- Snapshot generation: succeeded"
+            echo "- Official data fetch: births, unemployment-rate, and population succeeded"
+            echo "- Validation: snapshot schema, indicators, sources, and revision history succeeded"
             echo "- Blob snapshot upload enabled: \`$PRODUCTION_SNAPSHOT_UPLOAD\`"
             echo
             echo "Stage 3 was not started. Review these immutable digests before manually dispatching Stage 3."
@@ -373,3 +377,4 @@ jobs:
         run: |
           set -eu
           [ -z "${SNAPSHOT_DIRECTORY:-}" ] || rm -rf "$SNAPSHOT_DIRECTORY"
+          [ -z "${PREVIOUS_SNAPSHOT_DIRECTORY:-}" ] || rm -rf "$PREVIOUS_SNAPSHOT_DIRECTORY"

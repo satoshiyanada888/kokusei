@@ -5,14 +5,13 @@ set -eu
 
 stage2_workflow=.github/workflows/prepare-production.yml
 stage3_workflow=.github/workflows/deploy-production.yml
-stage2=scripts/production/run-stage2.sh
-url_validator=scripts/production/validate-neon-urls.py
 oidc_validator=scripts/production/verify-github-oidc-claims.py
 platform_verifier=scripts/production/verify-image-platform.sh
 acr_login_server_validator=scripts/production/validate-acr-login-server.sh
 stage2_evidence_validator=scripts/production/validate-stage2-evidence.py
 container_app_state_validator=scripts/production/verify-container-app-state.py
 snapshot_uploader=scripts/production/upload-blob-snapshot.sh
+snapshot_downloader=scripts/production/download-current-blob-snapshot.sh
 frontend_config=frontend/next.config.ts
 frontend_middleware=frontend/middleware.ts
 
@@ -131,14 +130,17 @@ require "PREPARE" "$stage2_workflow"
 require 'ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}' "$stage2_workflow"
 require 'PRODUCTION_SNAPSHOT_UPLOAD: ${{ vars.PRODUCTION_SNAPSHOT_UPLOAD || '\''false'\'' }}' "$stage2_workflow"
 require "Generate and validate the official JSON snapshot" "$stage2_workflow"
+require "Download and verify the currently published Blob snapshot" "$stage2_workflow"
+require "scripts/production/download-current-blob-snapshot.sh" "$stage2_workflow"
 require "Upload and read back the immutable Blob snapshot" "$stage2_workflow"
 require "scripts/production/upload-blob-snapshot.sh" "$stage2_workflow"
 require "/export-snapshot" "$stage2_workflow"
 require "--commit-sha \"\$GITHUB_SHA\"" "$stage2_workflow"
+require "--previous /previous/dataset.json" "$stage2_workflow"
 require "AZURE_CONTAINER_REGISTRY ACR_LOGIN_SERVER" "$stage2_workflow"
 require 'az acr login --name "$AZURE_CONTAINER_REGISTRY"' "$stage2_workflow"
 require 'registry="$(scripts/production/validate-acr-login-server.sh)"' "$stage2_workflow"
-require "Build linux/amd64 application and migration images" "$stage2_workflow"
+require "Build linux/amd64 application images" "$stage2_workflow"
 require "docker buildx build --platform linux/amd64 --load" "$stage2_workflow"
 require "Refuse to overwrite an existing commit SHA tag" "$stage2_workflow"
 require "Refusing to overwrite existing ACR tag" "$stage2_workflow"
@@ -150,8 +152,8 @@ require "az acr manifest show-metadata" "$stage2_workflow"
 require "scripts/production/verify-image-platform.sh" "$stage2_workflow"
 require "Frontend manifest must be linux/amd64" "$stage2_workflow"
 require "Backend manifest must be linux/amd64" "$stage2_workflow"
-require "Migrate Neon, import official data, and validate" "$stage2_workflow"
-require "scripts/production/run-stage2.sh" "$stage2_workflow"
+require "snapshot_generation: \"succeeded\"" "$stage2_workflow"
+require "official_data_fetch:" "$stage2_workflow"
 require "actions/upload-artifact@v4" "$stage2_workflow"
 require "production-stage2-\${{ github.sha }}" "$stage2_workflow"
 require "Stage 3 was not started" "$stage2_workflow"
@@ -219,8 +221,8 @@ require "digest is not tagged with the requested commit SHA" "$stage3_workflow"
 require "scripts/production/verify-image-platform.sh" "$stage3_workflow"
 require "Create or update internal Backend" "$stage3_workflow"
 require 'external: false' "$stage3_workflow"
-require 'PRODUCTION_DATA_STORE: ${{ vars.PRODUCTION_DATA_STORE || '\''postgres'\'' }}' "$stage3_workflow"
-require 'case "$PRODUCTION_DATA_STORE" in' "$stage3_workflow"
+require 'PRODUCTION_DATA_STORE: ${{ vars.PRODUCTION_DATA_STORE || '\''blob'\'' }}' "$stage3_workflow"
+require '[ "$PRODUCTION_DATA_STORE" = "blob" ]' "$stage3_workflow"
 require '{name: "DATA_STORE", value: $data_store}' "$stage3_workflow"
 require '{name: "AZURE_STORAGE_ACCOUNT_NAME", value: $storage_account}' "$stage3_workflow"
 require '{name: "AZURE_STORAGE_CONTAINER_NAME", value: $storage_container}' "$stage3_workflow"
@@ -425,13 +427,8 @@ if grep -E 'az containerapp (delete|revision deactivate)|gh run (rerun|run)' "$s
   exit 1
 fi
 
-if grep -F "scripts/production/run-stage2.sh" "$stage3_workflow" >/dev/null; then
-  echo "Stage 3 must not run Migration or official data import" >&2
-  exit 1
-fi
-
-if grep -E 'NEON_MIGRATION_DATABASE_URL|ESTAT_APP_ID' "$stage3_workflow" >/dev/null; then
-  echo "Stage 3 must not read Migration or importer secrets" >&2
+if grep -E 'NEON_|DATABASE_URL|APP_DATABASE_USER|run-stage2[.]sh|kokusei-migration' "$stage2_workflow" "$stage3_workflow" >/dev/null; then
+  echo "Production workflows must not depend on Neon, database URLs, or migration images" >&2
   exit 1
 fi
 
@@ -442,7 +439,7 @@ for workflow in "$stage2_workflow" "$stage3_workflow"; do
   fi
 done
 
-if grep -F 'set -x' "$stage2_workflow" "$stage3_workflow" "$stage2" "$url_validator" "$oidc_validator" "$platform_verifier" "$acr_login_server_validator" >/dev/null; then
+if grep -F 'set -x' "$stage2_workflow" "$stage3_workflow" "$snapshot_downloader" "$snapshot_uploader" "$oidc_validator" "$platform_verifier" "$acr_login_server_validator" >/dev/null; then
   echo "Production workflows and scripts must not enable shell tracing" >&2
   exit 1
 fi
@@ -451,12 +448,17 @@ python3 "$stage2_evidence_validator" self-test >/dev/null
 python3 "$container_app_state_validator" --self-test >/dev/null
 
 require '--auth-mode login' "$snapshot_uploader"
+require '--auth-mode login' "$snapshot_downloader"
+require 'PREVIOUS_SNAPSHOT_PRESENT=false' "$snapshot_downloader"
+require 'snapshots/$commit_sha/dataset.json' "$snapshot_downloader"
+require 'Previous snapshot SHA-256 does not match current.json' "$snapshot_downloader"
+require 'Current Blob manifest contains an unsafe snapshot path' "$snapshot_downloader"
 require 'snapshots/$GITHUB_SHA/dataset.json' "$snapshot_uploader"
 require 'Refusing to overwrite a different snapshot for the same commit SHA' "$snapshot_uploader"
 require 'Uploaded snapshot SHA-256 read-back mismatch' "$snapshot_uploader"
 require 'current.json is updated only after dataset upload and read-back validation succeed' "$snapshot_uploader"
 require 'SNAPSHOT_READ_BACK_SUCCEEDED=true' "$snapshot_uploader"
-if grep -E -- '--account-key|--sas-token|connection-string|AZURE_STORAGE_CONNECTION_STRING' "$stage2_workflow" "$stage3_workflow" "$snapshot_uploader" >/dev/null; then
+if grep -E -- '--account-key|--sas-token|connection-string|AZURE_STORAGE_CONNECTION_STRING' "$stage2_workflow" "$stage3_workflow" "$snapshot_downloader" "$snapshot_uploader" >/dev/null; then
   echo "Blob snapshot workflows must not use a Storage Account key, SAS, or connection string" >&2
   exit 1
 fi
@@ -509,41 +511,35 @@ if AZURE_CONTAINER_REGISTRY=otherregistry \
   exit 1
 fi
 
-if grep -E 'docker (build|buildx build) .*\b(NEON_DATABASE_URL|NEON_MIGRATION_DATABASE_URL|ESTAT_APP_ID)\b' "$stage2_workflow" >/dev/null; then
+if grep -E 'docker (build|buildx build) .*\bESTAT_APP_ID\b' "$stage2_workflow" >/dev/null; then
   echo "Production secrets must not be passed as Docker build arguments" >&2
   exit 1
 fi
 
-if grep -E '(:latest|/latest)' "$stage2_workflow" "$stage3_workflow" "$stage2" >/dev/null; then
+if grep -E '(:latest|/latest)' "$stage2_workflow" "$stage3_workflow" >/dev/null; then
   echo "Production workflows must not use a latest image tag" >&2
   exit 1
 fi
 
-if grep -F 'docker push "$MIGRATION_IMAGE"' "$stage2_workflow" "$stage2" >/dev/null; then
-  echo "Migration image must not be pushed to ACR" >&2
-  exit 1
-fi
-
-if grep -E '(echo|printf).*(NEON_DATABASE_URL|NEON_MIGRATION_DATABASE_URL|DATABASE_URL)' "$stage2_workflow" "$stage3_workflow" "$stage2" >/dev/null; then
+if grep -E '(echo|printf).*(DATABASE_URL|ESTAT_APP_ID)' "$stage2_workflow" "$stage3_workflow" >/dev/null; then
   echo "Production secrets must not be written to logs or summaries" >&2
   exit 1
 fi
 
-if grep -F -- '--env DATABASE_URL=' "$stage2_workflow" "$stage3_workflow" "$stage2" >/dev/null; then
+if grep -F -- '--env DATABASE_URL=' "$stage2_workflow" "$stage3_workflow" >/dev/null; then
   echo "Database URLs must not be placed in Docker command arguments" >&2
   exit 1
 fi
 
 manifest_line=$(grep -n -m1 'Resolve digests and verify linux/amd64 manifests' "$stage2_workflow" | cut -d: -f1)
-database_line=$(grep -n -m1 'Migrate Neon, import official data, and validate' "$stage2_workflow" | cut -d: -f1)
+snapshot_download_line=$(grep -n -m1 'Download and verify the currently published Blob snapshot' "$stage2_workflow" | cut -d: -f1)
 snapshot_generate_line=$(grep -n -m1 'Generate and validate the official JSON snapshot' "$stage2_workflow" | cut -d: -f1)
 snapshot_upload_line=$(grep -n -m1 'Upload and read back the immutable Blob snapshot' "$stage2_workflow" | cut -d: -f1)
 metadata_line=$(grep -n -m1 'Write safe Stage 2 metadata' "$stage2_workflow" | cut -d: -f1)
-[ "$manifest_line" -lt "$database_line" ] || { echo "Manifest validation must precede database changes" >&2; exit 1; }
-[ "$database_line" -lt "$snapshot_generate_line" ] || { echo "Neon validation must precede snapshot generation in Phase 1" >&2; exit 1; }
+[ "$manifest_line" -lt "$snapshot_download_line" ] || { echo "Image manifest validation must precede previous snapshot download" >&2; exit 1; }
+[ "$snapshot_download_line" -lt "$snapshot_generate_line" ] || { echo "Previous snapshot verification must precede snapshot generation" >&2; exit 1; }
 [ "$snapshot_generate_line" -lt "$snapshot_upload_line" ] || { echo "Snapshot validation must precede Blob upload" >&2; exit 1; }
 [ "$snapshot_upload_line" -lt "$metadata_line" ] || { echo "Blob read-back must precede Stage 2 metadata" >&2; exit 1; }
-[ "$database_line" -lt "$metadata_line" ] || { echo "Successful database validation must precede Stage 2 metadata" >&2; exit 1; }
 
 backend_line=$(grep -n -m1 'Create or update internal Backend' "$stage3_workflow" | cut -d: -f1)
 backend_traffic_line=$(grep -n -m1 -- '--revision-weight "$backend_revision=100"' "$stage3_workflow" | cut -d: -f1)
@@ -564,35 +560,6 @@ smoke_line=$(grep -n -m1 'Run public smoke tests' "$stage3_workflow" | cut -d: -
 [ "$frontend_readback_line" -lt "$frontend_health_line" ] || { echo "Frontend read-back must precede Frontend health validation" >&2; exit 1; }
 [ "$frontend_line" -lt "$frontend_health_line" ] || { echo "Frontend deployment must precede Frontend health validation" >&2; exit 1; }
 [ "$frontend_health_line" -lt "$smoke_line" ] || { echo "Frontend health must precede public smoke tests" >&2; exit 1; }
-
-require "docker image inspect" "$stage2"
-require "/import-births" "$stage2"
-require "run_validation births" "$stage2"
-require "/import-unemployment" "$stage2"
-require "run_validation unemployment-rate" "$stage2"
-require "/import-population" "$stage2"
-require "run_validation population" "$stage2"
-require "run_validation all" "$stage2"
-require 'pooled=True' "$url_validator"
-require 'pooled=False' "$url_validator"
-require 'ALLOWED_SSL_MODES = {"require", "verify-ca", "verify-full"}' "$url_validator"
-require 'NEON_URL_VALIDATION_MODE' "$url_validator"
-
-valid_backend='postgresql://kokusei_backend:example@ep-example-pooler.ap-southeast-1.aws.neon.tech/kokusei?sslmode=require&channel_binding=require'
-valid_migration='postgresql://kokusei_migration:example@ep-example.ap-southeast-1.aws.neon.tech/kokusei?sslmode=require&channel_binding=require'
-NEON_DATABASE_URL="$valid_backend" NEON_MIGRATION_DATABASE_URL="$valid_migration" "$url_validator" >/dev/null
-NEON_DATABASE_URL="$valid_backend" NEON_URL_VALIDATION_MODE=backend "$url_validator" >/dev/null
-
-if NEON_DATABASE_URL="$valid_migration" NEON_MIGRATION_DATABASE_URL="$valid_backend" "$url_validator" >/dev/null 2>&1; then
-  echo "Neon URL validator accepted reversed pooled/direct endpoints" >&2
-  exit 1
-fi
-
-disabled_backend=$(printf '%s' "$valid_backend" | sed 's/sslmode=require/sslmode=disable/')
-if NEON_DATABASE_URL="$disabled_backend" NEON_URL_VALIDATION_MODE=backend "$url_validator" >/dev/null 2>&1; then
-  echo "Neon URL validator accepted disabled TLS" >&2
-  exit 1
-fi
 
 repository=satoshiyanada888/kokusei
 repository_owner=satoshiyanada888

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -10,9 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/kokusei/dashboard/backend/internal/database"
 	"github.com/kokusei/dashboard/backend/internal/provider"
-	"github.com/kokusei/dashboard/backend/internal/repository/postgres"
 	"github.com/kokusei/dashboard/backend/internal/snapshot"
 )
 
@@ -20,9 +19,11 @@ func main() {
 	var output string
 	var commitSHA string
 	var generatedAt string
+	var previousPath string
 	flag.StringVar(&output, "output", "", "path for dataset.json")
 	flag.StringVar(&commitSHA, "commit-sha", "", "full 40-character source commit SHA")
 	flag.StringVar(&generatedAt, "generated-at", "", "optional UTC RFC3339 generation time")
+	flag.StringVar(&previousPath, "previous", "", "optional path to the previously published dataset.json")
 	flag.Parse()
 	if output == "" {
 		log.Fatal("--output is required")
@@ -45,17 +46,21 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
-		pool, err := database.NewPool(context.Background(), databaseURL)
+	var previous *snapshot.Dataset
+	if previousPath != "" {
+		content, err := os.ReadFile(previousPath)
 		if err != nil {
 			log.Fatal(err)
 		}
-		updates, err := postgres.NewUpdateHistoryRepository(pool).List(context.Background())
-		pool.Close()
-		if err != nil {
+		var decoded snapshot.Dataset
+		if err := json.Unmarshal(content, &decoded); err != nil {
 			log.Fatal(err)
 		}
-		dataset.Updates = updates
+		previous = &decoded
+	}
+	dataset, err = snapshot.MergeRevisionHistory(dataset, previous)
+	if err != nil {
+		log.Fatal(err)
 	}
 	content, err := snapshot.Marshal(dataset)
 	if err != nil {

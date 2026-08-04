@@ -32,7 +32,8 @@ Browser → Next.js (App Router / TypeScript / Tailwind / Recharts)
 公式データを公開snapshotへ変換するStage 2:
 
 ```text
-公的機関の一次情報 → Import・検証（Neon PostgreSQL）
+公的機関の一次情報 → 正規化・検証 ─┐
+直前のBlob snapshot → 改訂差分 ───┤
                               ↓
                     immutable JSON snapshot
                               ↓
@@ -52,9 +53,9 @@ docs/       設計メモ
 
 ## Azure Container Appsへの本番デプロイ
 
-Azure Container Registry、Azure Container Apps、Azure Blob Storage、Neon PostgreSQL、GitHub Actions OIDCを使う本番構成を`infra/`と`.github/workflows/`に用意しています。Stage 1（Azure基盤）、Stage 2（Neon Migration・公式データ検証・image・Blob snapshot）、Stage 3（公開）に分けています。本番Backendはprivate Blob containerをManaged Identityで読み、NeonはStage 2のデータ生成・検証に使用します。Secret、Remote State、Migration、公式データ、コスト、ロールバックの手順は [docs/deployment/azure-container-apps.md](docs/deployment/azure-container-apps.md) を参照してください。
+Azure Container Registry、Azure Container Apps、Azure Blob Storage、GitHub Actions OIDCを使う本番構成を`infra/`と`.github/workflows/`に用意しています。Stage 1（Azure基盤）、Stage 2（公式データ取得・image・Blob snapshot）、Stage 3（公開）に分けています。本番Backendはprivate Blob containerをManaged Identityで読みます。本番WorkflowはNeon PostgreSQLへ接続しません。Secret、Remote State、公式データ、コスト、ロールバックの手順は [docs/deployment/azure-container-apps.md](docs/deployment/azure-container-apps.md) を参照してください。
 
-Terraformコードの作成だけではAzureリソースは作られません。Subscription、権限、料金、Resource Group、名前衝突を確認し、`terraform plan`の内容について承認を得てからapplyしてください。Neon pooled/direct URLはGitHub `production` Environment Secretsからのみ渡し、Git、tfvars、saved plan、Terraform Stateへ保存しません。出生数と完全失業率の公式取得仕様は [docs/data-sources/births-and-unemployment.md](docs/data-sources/births-and-unemployment.md) を参照してください。
+Terraformコードの作成だけではAzureリソースは作られません。Subscription、権限、料金、Resource Group、名前衝突を確認し、`terraform plan`の内容について承認を得てからapplyしてください。Stage 2の公式データ取得に必要なAPI keyはGitHub `production` Environment Secretからのみ渡し、Git、tfvars、saved plan、Terraform Stateへ保存しません。出生数と完全失業率の公式取得仕様は [docs/data-sources/births-and-unemployment.md](docs/data-sources/births-and-unemployment.md) を参照してください。
 
 ## 必要なソフトウェア
 

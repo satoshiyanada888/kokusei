@@ -6,7 +6,7 @@
 
 ## 状態
 
-承認（Phase 1実装。Production切替は未承認）
+廃止（[ADR 002](002-remove-neon-from-production-pipeline.md)により置換）
 
 ## 背景
 
