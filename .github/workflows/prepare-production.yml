@@ -123,7 +123,7 @@ jobs:
           for name in "${required[@]}"; do
             [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
           done
-          case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
+          scripts/production/validate-public-site-url.py >/dev/null
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "GITHUB_SHA must be a full commit SHA"; exit 1; }
           scripts/production/validate-acr-login-server.sh >/dev/null
           [ "$PRODUCTION_SNAPSHOT_UPLOAD" = "true" ] || {

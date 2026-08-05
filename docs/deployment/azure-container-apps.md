@@ -88,7 +88,7 @@ Variables:
 - `FRONTEND_IDENTITY_ID`: Terraform `frontend_identity_id`
 - `BACKEND_IDENTITY_ID`: Terraform `backend_identity_id`
 - `BACKEND_IDENTITY_CLIENT_ID`: Terraform `backend_identity_client_id`（Blob credential選択）
-- `NEXT_PUBLIC_SITE_URL`: 下記の初回FQDN
+- `NEXT_PUBLIC_SITE_URL`: 利用者へ公開するHTTPS origin。初回は下記の既定FQDN、独自ドメイン移行後は検証済みの独自ドメイン
 - `PRODUCTION_SNAPSHOT_UPLOAD`: Productionでは`true`
 - `PRODUCTION_DATA_STORE`: Productionでは`blob`
 - `AZURE_STORAGE_ACCOUNT_NAME`: Terraform `app_data_storage_account_name`
@@ -132,9 +132,10 @@ Stage 3を起動せずに終了する。
 - 指定Run IDに所属する有効な`production-stage2-<commit SHA>`が1件だけ存在することを確認し、そのartifact IDを直接取得する。metadataのcommit SHA、両digest、`linux/amd64`、snapshot生成、3 Provider取得、全Validation、Blob upload/read-backを入力値と完全一致検証する。他runや同名複数artifactを最新順で選ばない。
 - Stage 3 Workflow自体を変更したcommitでは、その新commitを対象にStage 2を改めて1回実行して新しいartifactとdigestを作る。古いStage 2 artifactを新しいWorkflow SHAへ流用しない。
 - Stage 3は入力digestがACRに存在し、入力commit SHA tagと対応し、`linux/amd64`であることを再確認する。Container AppsとSmoke Jobはtagではなく`repository@sha256:...`を使用する。
+- Container Apps Environmentのdefault domainから得るFrontend既定FQDNはAzureリソースの同一性確認に使い、`NEXT_PUBLIC_SITE_URL`は利用者向け公開originとして別に扱う。独自ドメインを使う場合は、Container Apps変更前に既存Frontendへ同じhostnameのSNI bindingが1件あり、Managed Certificateが`Succeeded`であることを確認する。
 - Backend: internal ingress、port 8080、0.25 vCPU/0.5 GiB、min 0/max 2、non-root、専用Managed IdentityによるACR pullとprivate Blob read。`/health`をStartup/Liveness/Readiness probeに使う。`/health`はprocess-onlyで、後続API SmokeがBlob snapshot読込を確認する。Container AppへDB Secretや`DATABASE_URL`は設定しない。
 - Backend health、指標一覧、人口・出生数・完全失業率の詳細APIを同一Container Apps Environment内の手動Trigger Smoke Jobで確認する。配列が空でないこと、3 slugが存在すること、一覧と詳細の最新値がnullまたは空文字でないことも検証する。
-- 成功後にFrontendをexternal ingress、port 3000、0.25 vCPU/0.5 GiB、min 0/max 2で作成/更新し、server-side `INTERNAL_API_URL`でBackend internal FQDNへ接続する。`NEXT_PUBLIC_SITE_URL`はStage 2のbuild argに加え、Stage 3で同じGitHub Environment Variableを実行時環境変数として設定する。Frontendの軽量な`/health`をStartup/Liveness/Readiness probeに使用する。ブラウザからBackendへ直接接続しない。
+- 成功後にFrontendをexternal ingress、port 3000、0.25 vCPU/0.5 GiB、min 0/max 2で作成/更新し、server-side `INTERNAL_API_URL`でBackend internal FQDNへ接続する。`NEXT_PUBLIC_SITE_URL`はStage 2のbuild argに加え、Stage 3で同じGitHub Environment Variableを実行時環境変数として設定する。更新時は既存の`customDomains`を仕様へ明示的に引き継ぎ、独自ドメインbindingを消さない。Frontendの軽量な`/health`をStartup/Liveness/Readiness probeに使用する。ブラウザからBackendへ直接接続しない。
 - BackendとFrontendは対象RevisionへTrafficを明示的に100%割り当てる。AzureからAppとRevisionをread-backし、名前、Ingress、port、digest URI、ACR server、Managed Identity、Secret reference、active Revision、Traffic合計100%と旧Revision 0%を検証する。Frontendはexternal、Backendはinternalでなければ失敗する。
 
 WorkflowはBackend仕様を権限`0600`の一時ディレクトリへ生成し、`az containerapp create/update --yaml`へ渡す。shellの`trap`で成功・失敗・signalを問わずディレクトリを削除し、Gitやartifactへ残さない。
@@ -153,11 +154,15 @@ Next.js 15.5.22のstandalone成果物には`sharp 0.34.5`が含まれ、`GHSA-f8
 
 この制限は、production container内の`sharp`が修正版（少なくとも`0.35.0`）へ更新され、対象Advisoryと`npm audit --omit=dev`を再確認し、同じ実コンテナ試験に合格するまで解除しない。将来`next/image`を導入する場合も、先にこの更新・再検証を行う。
 
-## NEXT_PUBLIC_SITE_URL初回設定
+## NEXT_PUBLIC_SITE_URLと独自ドメイン
 
-Container Apps Environmentのdefault domainと固定app名から、Terraform `expected_frontend_url`が予定HTTPS FQDNを出力する。Stage 1 apply後にこの値を確認し、Azure Portal/CLIで想定nameとdomainを照合してGitHub Variableへ設定する。これにより仮Frontend app/imageを作らず正式buildできる。
+Container Apps Environmentのdefault domainと固定app名から、Terraform `expected_frontend_url`が予定HTTPS FQDNを出力する。この値は初回公開時の`NEXT_PUBLIC_SITE_URL`と、以後のAzure既定FQDNの照合に使う。独自ドメインへ移行した後の`NEXT_PUBLIC_SITE_URL`は、利用者がアクセスする独自ドメインのHTTPS originであり、`expected_frontend_url`とは一致しなくてよい。
 
-初回だけWorkflowはFrontendをinternal ingressで作成し、実FQDNと`NEXT_PUBLIC_SITE_URL`が一致した後にexternalへ変更する。不一致ならinternalのまま失敗するため、localhost/仮URLを公開状態に残さない。URL変更時はVariable更新後に新commit SHAのFrontendを再build/deployする。
+この分離の理由とトレードオフは[Container Apps既定FQDNと公開originを分離する](../decisions/003-separate-platform-fqdn-from-public-origin.md)に記録する。
+
+独自ドメインへの切替では、先にDNS、Container Apps custom domain binding、Managed Certificateの`Succeeded`を確認する。次にWorkflow対応commitを公開し、GitHub Environment Variableを検証済みのHTTPS origin（例: `https://kokusei.yanada.tokyo`）へ更新して、新しいcommit SHAでStage 2とStage 3を実行する。Stage 3はAzure既定FQDNと公開originを別々に検証し、独自ドメインbindingと証明書が不完全ならContainer Apps更新前に停止する。
+
+Frontend更新では既存の`customDomains`をcreate/update共通仕様へ保持し、read-backでも公開hostname、`SniEnabled`、certificate参照を確認する。これにより、イメージ更新やRevision作成が独自ドメインbindingを意図せず除去することを防ぐ。初回に独自ドメインを使う場合はFrontendへbindingを準備できないため、まず既定FQDNで公開してから切り替える。
 
 `NEXT_PUBLIC_SITE_URL`はビルド時と実行時の両方で必要である。動的metadata、sitemap、OGPはContainer App起動後に評価される経路があり、実行時設定がないと`http://localhost:3000`へフォールバックする可能性がある。WorkflowはFrontend Revisionから`INTERNAL_API_URL`と`NEXT_PUBLIC_SITE_URL`をread-backし、後者がGitHub Environment VariableのHTTPS URLと一致し、localhostを含まないことを確認する。公開Smokeではcanonical、`og:url`、`og:image`、Twitter image、sitemap、robotsを確認し、ページ表示の成功だけでは公開完了と判定しない。
 

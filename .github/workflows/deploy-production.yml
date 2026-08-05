@@ -164,7 +164,7 @@ jobs:
           for name in "${required[@]}"; do
             [ -n "${!name:-}" ] || { echo "Required production setting is missing: $name"; exit 1; }
           done
-          case "$NEXT_PUBLIC_SITE_URL" in https://*) ;; *) echo "NEXT_PUBLIC_SITE_URL must use HTTPS"; exit 1 ;; esac
+          scripts/production/validate-public-site-url.py >/dev/null
           scripts/production/validate-acr-login-server.sh >/dev/null
           [ "$PRODUCTION_DATA_STORE" = "blob" ] || {
             echo "PRODUCTION_DATA_STORE must be blob for production Stage 3"
@@ -235,19 +235,63 @@ jobs:
             echo "REVISION_SUFFIX=sha-${TARGET_COMMIT:0:8}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           } >> "$GITHUB_ENV"
 
-      - name: Verify the expected Frontend FQDN before deployment
+      - name: Verify Frontend platform FQDN and public custom domain before deployment
         shell: bash
         run: |
           set -euo pipefail
+          site_url="$(scripts/production/validate-public-site-url.py)"
+          public_site_host="${site_url#https://}"
           environment_domain="$(az containerapp env show \
             -g "$AZURE_RESOURCE_GROUP" \
             -n "$AZURE_CONTAINER_APP_ENVIRONMENT" \
             --query properties.defaultDomain -o tsv)"
-          expected_url="https://$AZURE_CONTAINER_APP_FRONTEND.$environment_domain"
-          [ "$expected_url" = "${NEXT_PUBLIC_SITE_URL%/}" ] || {
-            echo "NEXT_PUBLIC_SITE_URL does not match the expected Frontend FQDN"
+          platform_fqdn="$AZURE_CONTAINER_APP_FRONTEND.$environment_domain"
+
+          if frontend_json="$(az containerapp show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$AZURE_CONTAINER_APP_FRONTEND" \
+            --output json 2>/dev/null)"; then
+            actual_fqdn="$(jq -er '.properties.configuration.ingress.fqdn' <<<"$frontend_json")"
+            [ "$actual_fqdn" = "$platform_fqdn" ] || {
+              echo "Frontend platform FQDN does not match the Container Apps environment"
+              exit 1
+            }
+            if [ "$public_site_host" != "$platform_fqdn" ]; then
+              certificate_id="$(jq -er --arg host "$public_site_host" '
+                [
+                  .properties.configuration.ingress.customDomains[]?
+                  | select(
+                      .name == $host
+                      and .bindingType == "SniEnabled"
+                      and (.certificateId | type == "string" and length > 0)
+                    )
+                  | .certificateId
+                ]
+                | if length == 1 then .[0] else error("public custom domain binding is missing or ambiguous") end
+              ' <<<"$frontend_json")"
+              certificate_json="$(az resource show \
+                --ids "$certificate_id" \
+                --api-version 2025-01-01 \
+                --output json)"
+              jq -e --arg host "$public_site_host" '
+                .properties.subjectName == $host
+                and .properties.provisioningState == "Succeeded"
+              ' <<<"$certificate_json" >/dev/null || {
+                echo "Frontend managed certificate is not ready for the public custom domain"
+                exit 1
+              }
+            fi
+          elif [ "$public_site_host" != "$platform_fqdn" ]; then
+            echo "Frontend must exist with a secured custom domain before using a custom NEXT_PUBLIC_SITE_URL"
             exit 1
-          }
+          fi
+
+          {
+            echo "PUBLIC_SITE_URL=$site_url"
+            echo "PUBLIC_SITE_HOST=$public_site_host"
+            echo "FRONTEND_PLATFORM_FQDN=$platform_fqdn"
+          } >> "$GITHUB_ENV"
+          unset frontend_json certificate_json certificate_id
 
       - name: Create or update internal Backend
         shell: bash
@@ -437,7 +481,36 @@ jobs:
           trap cleanup EXIT HUP INT TERM
 
           environment_id="$(az containerapp env show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_ENVIRONMENT" --query id -o tsv)"
-          site_url="${NEXT_PUBLIC_SITE_URL%/}"
+          site_url="$PUBLIC_SITE_URL"
+          custom_domains='[]'
+          frontend_exists=false
+          if frontend_json="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --output json 2>/dev/null)"; then
+            frontend_exists=true
+            actual_fqdn="$(jq -er '.properties.configuration.ingress.fqdn' <<<"$frontend_json")"
+            [ "$actual_fqdn" = "$FRONTEND_PLATFORM_FQDN" ] || {
+              echo "Frontend platform FQDN changed after pre-deployment validation"
+              exit 1
+            }
+            custom_domains="$(jq -c '.properties.configuration.ingress.customDomains // []' <<<"$frontend_json")"
+            if [ "$PUBLIC_SITE_HOST" != "$FRONTEND_PLATFORM_FQDN" ]; then
+              jq -e --arg host "$PUBLIC_SITE_HOST" '
+                [
+                  .[]
+                  | select(
+                      .name == $host
+                      and .bindingType == "SniEnabled"
+                      and (.certificateId | type == "string" and length > 0)
+                    )
+                ] | length == 1
+              ' <<<"$custom_domains" >/dev/null || {
+                echo "Frontend public custom domain binding changed before deployment"
+                exit 1
+              }
+            fi
+          elif [ "$PUBLIC_SITE_HOST" != "$FRONTEND_PLATFORM_FQDN" ]; then
+            echo "Frontend custom domain binding is required before deployment"
+            exit 1
+          fi
           specification="$temporary_directory/frontend-container-app.json"
           internal_specification="$temporary_directory/frontend-container-app-internal.json"
           jq -n \
@@ -448,13 +521,20 @@ jobs:
             --arg revision "$REVISION_SUFFIX" \
             --arg backend_url "$BACKEND_URL" \
             --arg site_url "$site_url" \
+            --argjson custom_domains "$custom_domains" \
             '{
               identity: {type: "UserAssigned", userAssignedIdentities: {($identity_id): {}}},
               properties: {
                 environmentId: $environment_id,
                 configuration: {
                   activeRevisionsMode: "Multiple",
-                  ingress: {external: true, targetPort: 3000, transport: "auto", allowInsecure: false},
+                  ingress: {
+                    external: true,
+                    targetPort: 3000,
+                    transport: "auto",
+                    allowInsecure: false,
+                    customDomains: $custom_domains
+                  },
                   registries: [{server: $registry, identity: $identity_id}]
                 },
                 template: {
@@ -478,7 +558,7 @@ jobs:
               }
             }' > "$specification"
 
-          if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --output none 2>/dev/null; then
+          if [ "$frontend_exists" = "true" ]; then
             az containerapp update -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" \
               --yaml "$specification" --only-show-errors --output none
           else
@@ -491,7 +571,7 @@ jobs:
           fi
 
           frontend_fqdn="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.configuration.ingress.fqdn -o tsv)"
-          [ "https://$frontend_fqdn" = "$site_url" ] || { echo "Frontend FQDN does not match NEXT_PUBLIC_SITE_URL"; exit 1; }
+          [ "$frontend_fqdn" = "$FRONTEND_PLATFORM_FQDN" ] || { echo "Frontend platform FQDN read-back does not match"; exit 1; }
           frontend_revision="$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND" --query properties.latestRevisionName -o tsv)"
           [ -n "$frontend_revision" ] || { echo "Frontend active revision is missing"; exit 1; }
           az containerapp ingress traffic set \
@@ -518,6 +598,7 @@ jobs:
             EXPECTED_IMAGE="$FRONTEND_IMAGE" \
             EXPECTED_REGISTRY="$REGISTRY" \
             EXPECTED_IDENTITY_ID="$FRONTEND_IDENTITY_ID" \
+            EXPECTED_PUBLIC_HOST="$PUBLIC_SITE_HOST" \
             scripts/production/verify-container-app-state.py \
               "$frontend_app_json" "$frontend_revision_json"
 
@@ -555,7 +636,8 @@ jobs:
             }
 
           {
-            echo "FRONTEND_URL=https://$frontend_fqdn"
+            echo "FRONTEND_URL=$site_url"
+            echo "FRONTEND_PLATFORM_URL=https://$frontend_fqdn"
             echo "FRONTEND_REVISION=$frontend_revision"
           } >> "$GITHUB_ENV"
 
@@ -571,7 +653,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          site="${NEXT_PUBLIC_SITE_URL%/}"
+          site="$PUBLIC_SITE_URL"
           normalize_public_url() {
             local value="$1"
             [ -n "$value" ] || return 1
@@ -634,6 +716,7 @@ jobs:
             echo "- Stage 2 run ID: \`$STAGE2_RUN_ID\`"
             echo "- Commit SHA: \`$TARGET_COMMIT\`"
             echo "- Frontend URL: $FRONTEND_URL"
+            echo "- Frontend platform URL: $FRONTEND_PLATFORM_URL"
             echo "- Frontend revision: \`$FRONTEND_REVISION\`"
             echo "- Frontend digest: \`$FRONTEND_DIGEST\`"
             echo "- Frontend ingress/traffic read-back: external, target revision 100%"

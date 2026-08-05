@@ -8,6 +8,7 @@ stage3_workflow=.github/workflows/deploy-production.yml
 oidc_validator=scripts/production/verify-github-oidc-claims.py
 platform_verifier=scripts/production/verify-image-platform.sh
 acr_login_server_validator=scripts/production/validate-acr-login-server.sh
+public_site_url_validator=scripts/production/validate-public-site-url.py
 stage2_evidence_validator=scripts/production/validate-stage2-evidence.py
 container_app_state_validator=scripts/production/verify-container-app-state.py
 snapshot_uploader=scripts/production/upload-blob-snapshot.sh
@@ -217,6 +218,8 @@ require 'registry="$(scripts/production/validate-acr-login-server.sh)"' "$stage3
 require 'FRONTEND_IMAGE=$registry/frontend@$FRONTEND_DIGEST' "$stage3_workflow"
 require 'BACKEND_IMAGE=$registry/backend@$BACKEND_DIGEST' "$stage3_workflow"
 require 'NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}' "$stage3_workflow"
+require 'scripts/production/validate-public-site-url.py >/dev/null' "$stage2_workflow"
+require 'scripts/production/validate-public-site-url.py >/dev/null' "$stage3_workflow"
 require "digest is not tagged with the requested commit SHA" "$stage3_workflow"
 require "scripts/production/verify-image-platform.sh" "$stage3_workflow"
 require "Create or update internal Backend" "$stage3_workflow"
@@ -232,6 +235,14 @@ require 'EXPECTED_DATA_STORE="$PRODUCTION_DATA_STORE"' "$stage3_workflow"
 require 'EXPECTED_BACKEND_CLIENT_ID="$BACKEND_IDENTITY_CLIENT_ID"' "$stage3_workflow"
 require "Create or update Frontend after Backend validation" "$stage3_workflow"
 require 'external: true' "$stage3_workflow"
+require "Verify Frontend platform FQDN and public custom domain before deployment" "$stage3_workflow"
+require 'site_url="$(scripts/production/validate-public-site-url.py)"' "$stage3_workflow"
+require 'public_site_host="${site_url#https://}"' "$stage3_workflow"
+require '.properties.configuration.ingress.customDomains[]?' "$stage3_workflow"
+require '.bindingType == "SniEnabled"' "$stage3_workflow"
+require '.certificateId | type == "string" and length > 0' "$stage3_workflow"
+require '.properties.provisioningState == "Succeeded"' "$stage3_workflow"
+require '--api-version 2025-01-01' "$stage3_workflow"
 require 'path: "/health", port: 8080' "$stage3_workflow"
 require 'path: "/health", port: 3000' "$stage3_workflow"
 require "/health is intentionally process-only" "$stage3_workflow"
@@ -241,12 +252,15 @@ require "Verify Frontend health" "$stage3_workflow"
 require "Run public smoke tests" "$stage3_workflow"
 require "Write Stage 3 deployment summary" "$stage3_workflow"
 require '--build-arg NEXT_PUBLIC_SITE_URL="$NEXT_PUBLIC_SITE_URL"' "$stage2_workflow"
-require 'site_url="${NEXT_PUBLIC_SITE_URL%/}"' "$stage3_workflow"
+require 'site="$PUBLIC_SITE_URL"' "$stage3_workflow"
 require '--arg site_url "$site_url"' "$stage3_workflow"
 require '{name: "INTERNAL_API_URL", value: $backend_url}' "$stage3_workflow"
 require '{name: "NEXT_PUBLIC_SITE_URL", value: $site_url}' "$stage3_workflow"
 require 'Frontend INTERNAL_API_URL read-back does not match' "$stage3_workflow"
 require 'Frontend NEXT_PUBLIC_SITE_URL read-back does not match the production HTTPS URL' "$stage3_workflow"
+require 'EXPECTED_PUBLIC_HOST="$PUBLIC_SITE_HOST"' "$stage3_workflow"
+require 'echo "FRONTEND_URL=$site_url"' "$stage3_workflow"
+require 'echo "FRONTEND_PLATFORM_URL=https://$frontend_fqdn"' "$stage3_workflow"
 require 'normalize_public_url() {' "$stage3_workflow"
 require 'printf '\''%s'\'' "${value%/}"' "$stage3_workflow"
 require 'canonical_url="${BASH_REMATCH[1]}"' "$stage3_workflow"
@@ -265,6 +279,11 @@ require '"population", "births", "unemployment-rate"' "$stage3_workflow"
 if grep -F '<link rel=\"canonical\" href=\"$site/\"' "$stage3_workflow" >/dev/null ||
   grep -F 'property=\"og:url\" content=\"$site/\"' "$stage3_workflow" >/dev/null; then
   echo "Stage 3 public URL checks must not require a trailing slash with fixed grep" >&2
+  exit 1
+fi
+if grep -F 'NEXT_PUBLIC_SITE_URL does not match the expected Frontend FQDN' "$stage3_workflow" >/dev/null ||
+  grep -F '[ "https://$frontend_fqdn" = "$site_url" ]' "$stage3_workflow" >/dev/null; then
+  echo "Stage 3 must not conflate the public origin with the Container Apps platform FQDN" >&2
   exit 1
 fi
 
@@ -339,6 +358,14 @@ if [ "$(printf '%s\n' "$frontend_deployment_step" | grep -F -c -- '{name: "NEXT_
   echo "Stage 3 Frontend shared create/update specification must set one runtime NEXT_PUBLIC_SITE_URL" >&2
   exit 1
 fi
+printf '%s\n' "$frontend_deployment_step" | grep -F -- '--argjson custom_domains "$custom_domains"' >/dev/null || {
+  echo "Stage 3 Frontend specification must preserve existing custom domain bindings" >&2
+  exit 1
+}
+printf '%s\n' "$frontend_deployment_step" | grep -F 'customDomains: $custom_domains' >/dev/null || {
+  echo "Stage 3 Frontend ingress must include the preserved custom domain bindings" >&2
+  exit 1
+}
 printf '%s\n' "$frontend_deployment_step" | grep -F 'az containerapp create -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_CONTAINER_APP_FRONTEND"' >/dev/null || {
   echo "Stage 3 Frontend create must use the shared runtime specification" >&2
   exit 1
@@ -446,6 +473,7 @@ fi
 
 python3 "$stage2_evidence_validator" self-test >/dev/null
 python3 "$container_app_state_validator" --self-test >/dev/null
+python3 "$public_site_url_validator" --self-test >/dev/null
 
 require '--auth-mode login' "$snapshot_uploader"
 require '--auth-mode login' "$snapshot_downloader"
@@ -542,6 +570,7 @@ metadata_line=$(grep -n -m1 'Write safe Stage 2 metadata' "$stage2_workflow" | c
 [ "$snapshot_upload_line" -lt "$metadata_line" ] || { echo "Blob read-back must precede Stage 2 metadata" >&2; exit 1; }
 
 backend_line=$(grep -n -m1 'Create or update internal Backend' "$stage3_workflow" | cut -d: -f1)
+public_domain_line=$(grep -n -m1 'Verify Frontend platform FQDN and public custom domain before deployment' "$stage3_workflow" | cut -d: -f1)
 backend_traffic_line=$(grep -n -m1 -- '--revision-weight "$backend_revision=100"' "$stage3_workflow" | cut -d: -f1)
 backend_readback_line=$(grep -n -m1 'CONTAINER_APP_KIND=backend' "$stage3_workflow" | cut -d: -f1)
 backend_verify_line=$(grep -n -m1 'Verify internal Backend health' "$stage3_workflow" | cut -d: -f1)
@@ -550,6 +579,7 @@ frontend_traffic_line=$(grep -n -m1 -- '--revision-weight "$frontend_revision=10
 frontend_readback_line=$(grep -n -m1 'CONTAINER_APP_KIND=frontend' "$stage3_workflow" | cut -d: -f1)
 frontend_health_line=$(grep -n -m1 'Verify Frontend health' "$stage3_workflow" | cut -d: -f1)
 smoke_line=$(grep -n -m1 'Run public smoke tests' "$stage3_workflow" | cut -d: -f1)
+[ "$public_domain_line" -lt "$backend_line" ] || { echo "Public custom domain validation must precede Container App mutation" >&2; exit 1; }
 [ "$backend_line" -lt "$backend_traffic_line" ] || { echo "Backend deployment must precede Traffic assignment" >&2; exit 1; }
 [ "$backend_traffic_line" -lt "$backend_readback_line" ] || { echo "Backend Traffic assignment must precede read-back" >&2; exit 1; }
 [ "$backend_readback_line" -lt "$backend_verify_line" ] || { echo "Backend read-back must precede internal health validation" >&2; exit 1; }

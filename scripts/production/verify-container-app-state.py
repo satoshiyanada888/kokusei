@@ -58,6 +58,7 @@ def validate_state(
     expected_storage_container: str = "",
     expected_current_blob: str = "current.json",
     expected_backend_client_id: str = "",
+    expected_public_host: str = "",
 ) -> None:
     if kind not in {"frontend", "backend"}:
         raise StateError("Container App kind must be frontend or backend")
@@ -92,6 +93,17 @@ def validate_state(
     }
     if expected_external:
         checks["Frontend FQDN"] = bool(ingress.get("fqdn"))
+        if expected_public_host and expected_public_host != ingress.get("fqdn"):
+            custom_domains = ingress.get("customDomains", [])
+            checks["Frontend public custom domain"] = sum(
+                1
+                for domain in custom_domains
+                if isinstance(domain, dict)
+                and domain.get("name") == expected_public_host
+                and domain.get("bindingType") == "SniEnabled"
+                and isinstance(domain.get("certificateId"), str)
+                and bool(domain.get("certificateId"))
+            ) == 1
 
     containers = revision.get("properties", {}).get("template", {}).get(
         "containers", []
@@ -208,6 +220,7 @@ def fixture(kind: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
                     "external": external,
                     "targetPort": 3000 if external else 8080,
                     "fqdn": "frontend.example" if external else "backend.internal",
+                    "customDomains": [],
                     "traffic": [{"revisionName": revision_name, "weight": 100}],
                 },
                 "registries": [
@@ -244,6 +257,35 @@ def self_test() -> None:
         validate_state(app, revision, **expected)
 
     frontend, frontend_revision, frontend_expected = fixture("frontend")
+    custom_domain_frontend = deepcopy(frontend)
+    custom_domain_frontend["properties"]["configuration"]["ingress"][
+        "customDomains"
+    ] = [
+        {
+            "name": "kokusei.example",
+            "bindingType": "SniEnabled",
+            "certificateId": "/managedCertificates/kokusei-example",
+        }
+    ]
+    validate_state(
+        custom_domain_frontend,
+        frontend_revision,
+        **frontend_expected,
+        expected_public_host="kokusei.example",
+    )
+    missing_custom_domain = deepcopy(custom_domain_frontend)
+    missing_custom_domain["properties"]["configuration"]["ingress"][
+        "customDomains"
+    ] = []
+    expect_failure(
+        lambda: validate_state(
+            missing_custom_domain,
+            frontend_revision,
+            **frontend_expected,
+            expected_public_host="kokusei.example",
+        ),
+        "missing Frontend public custom domain",
+    )
     traffic_zero = deepcopy(frontend)
     traffic_zero["properties"]["configuration"]["ingress"]["traffic"][0][
         "weight"
@@ -357,7 +399,7 @@ def self_test() -> None:
         "Container App read-back validator self-test passed: normal Frontend/"
         "Backend, case-equivalent Resource ID, different Managed Identity, Blob Backend, "
         "Traffic 0%, Traffic total mismatch, Frontend internal, Backend external, "
-        "revision digest mismatch"
+        "revision digest mismatch, custom domain binding"
     )
 
 
@@ -396,6 +438,7 @@ def main() -> None:
             expected_backend_client_id=os.environ.get(
                 "EXPECTED_BACKEND_CLIENT_ID", ""
             ),
+            expected_public_host=os.environ.get("EXPECTED_PUBLIC_HOST", ""),
         )
         print("Container App read-back matches the immutable deployment inputs")
     except (StateError, AssertionError) as error:

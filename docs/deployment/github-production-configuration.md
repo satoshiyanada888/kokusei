@@ -43,7 +43,7 @@ API keyをRepository Secret、Variable、tfvars、backend.hcl、Terraform入力�
 | `FRONTEND_IDENTITY_ID` | Frontend ACR pull identity resource ID | `frontend_identity_id` output | Stage 1後 | guardで停止 |
 | `BACKEND_IDENTITY_ID` | Backend ACR pull identity resource ID | `backend_identity_id` output | Stage 1後 | guardで停止 |
 | `BACKEND_IDENTITY_CLIENT_ID` | Blob SDKが選択するBackend Managed Identity | `backend_identity_client_id` output | Blob切替前 | Blob mode guardで停止 |
-| `NEXT_PUBLIC_SITE_URL` | canonical/OGP/sitemap用HTTPS origin | `expected_frontend_url` output | Frontend初回build前 | guardで停止 |
+| `NEXT_PUBLIC_SITE_URL` | canonical/OGP/sitemap用の利用者向けHTTPS origin | 初回は`expected_frontend_url` output、独自ドメイン移行後は検証済みの公開URL | Frontend build前 | guardで停止 |
 | `PRODUCTION_SNAPSHOT_UPLOAD` | Stage 2 Blob upload（Productionは`true`必須） | Storage apply/read-back後に人間が設定 | deploy前 | `true`以外はguardで停止 |
 | `PRODUCTION_DATA_STORE` | Backend repository（Productionは`blob`必須） | Blob証跡確認後に人間が設定 | deploy前 | `blob`以外はguardで停止 |
 | `AZURE_STORAGE_ACCOUNT_NAME` | 公式snapshot用Storage Account | `app_data_storage_account_name` output | Blob Phase 2 | Blob mode guardで停止 |
@@ -64,6 +64,8 @@ BACKEND_IDENTITY_ID=<terraform output -raw backend_identity_id>
 ```
 
 Identity IDは手入力で組み立てない。Terraform outputと`az identity show -g rg-kokusei-prod -n <identity-name> --query id -o tsv`が一致することを確認してから登録する。
+
+独自ドメインへ移行した後は、`expected_frontend_url`を`NEXT_PUBLIC_SITE_URL`へ再転記しない。Container Apps既定FQDNはリソースの同一性確認用に残し、`NEXT_PUBLIC_SITE_URL`には利用者向けのHTTPS origin（現在は`https://kokusei.yanada.tokyo`）を設定する。Environment Variableを変更する前に、DNS、FrontendのSNI custom domain binding、Managed Certificateの`Succeeded`を確認する。変更後は新しいcommit SHAでStage 2とStage 3を実行し、canonical、OGP、sitemap、robotsの公開Smokeを通す。
 
 ### Terraform outputとRepository固定値
 
@@ -106,7 +108,7 @@ terraform output -raw expected_frontend_url
 | `backend_identity_client_id` | `BACKEND_IDENTITY_CLIENT_ID` |
 | `app_data_storage_account_name` | `AZURE_STORAGE_ACCOUNT_NAME` |
 | `app_data_storage_container_name` | `AZURE_STORAGE_CONTAINER_NAME` |
-| `expected_frontend_url` | `NEXT_PUBLIC_SITE_URL` |
+| `expected_frontend_url` | `NEXT_PUBLIC_SITE_URL`（初回のContainer Apps既定FQDNだけ） |
 
 | Repository固定値 | 用途 | 機密性 |
 |---|---|---|
@@ -223,7 +225,7 @@ az role assignment list --assignee <principal-id> --all -o table
 5. Stage 2のEnvironment承認後、prepare jobがOIDC login、linux/amd64 SHA image push、digest・manifest確認、直前Blob検証、公式Provider取得、snapshot生成・upload・read-backを実行して停止する。
 6. artifactとjob summaryで、完全なcommit SHA、Frontend/Backend URI・digest、`linux/amd64`、公式取得・snapshot検証・Blob read-back成功を確認する。ACRには完全なSHA tagだけがあることも確認する。
 7. Stage 3を別途手動実行し、確認済みStage 2 Run ID、commit SHAと2つのdigestを入力する。Environment承認前に指定runの成功、attempt 1、artifact所属、一意性、metadata、Stage 3 `github.sha`を再照合する。
-8. Stage 3はACR上でdigestの存在、SHA tagとの対応、platformを再検証し、タグではなくdigestでBackendを作成する。
+8. Stage 3はACR上でdigestの存在、SHA tagとの対応、platformを再検証する。さらにContainer Apps既定FQDNと利用者向け公開originを分離して照合し、独自ドメイン利用時はSNI bindingとManaged Certificateの成功を確認してから、タグではなくdigestでBackendを作成する。
 9. Backend内部Smoke成功後だけFrontendをexternalにし、Frontend health、HTTPS主要画面、canonical、OGP、sitemap、robotsを確認する。
 10. BackendとFrontendの対象RevisionへTrafficを100%設定し、AppとRevisionをread-backしてdigest、Ingress、port、registry、Managed Identity、Secret reference、Traffic合計100%を確認する。
 
